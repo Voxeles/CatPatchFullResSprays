@@ -1,8 +1,6 @@
 ﻿using System;
-using System.Collections;
-using System.Collections.Generic;
 using System.Collections.Concurrent;
-using System.Threading;
+using System.Threading.Tasks;
 using UnityEngine;
 using KrokoshaCasualtiesMP;
 using LiteNetLib;
@@ -24,7 +22,7 @@ public class NetworkController : MonoBehaviour
     private static bool _handlersRegistered = false;
     private static bool _serverHasMod = false;
     private ConcurrentDictionary<string, byte[]> compressedSpraysCache = [];
-    private ConcurrentDictionary<string, object> locksDict = [];
+    private ConcurrentDictionary<string, TaskCompletionSource<byte[]>> pendingRequests = [];
 
     public void Awake()
     {
@@ -191,36 +189,29 @@ public class NetworkController : MonoBehaviour
         
         if (compressedSpraysCache.TryGetValue(sprayId, out byte[] cachedCompressedImageBytes))
             return Deflate.DecompressData(cachedCompressedImageBytes);
+        
         if (Net.is_host)
             return null;
-        
-        var netDataWriter = Net.CreateWriter(ClientDownloadMsg);
-        netDataWriter.Put(sprayId);
-        Plugin.Logger.LogInfo($"Sending download request for {sprayId}");
-        Net.Client_Send(DeliveryMethod.Unreliable, netDataWriter);
 
-        var myLock = new object();
-        locksDict.TryAdd(sprayId, myLock);
-        lock (myLock)
-            Monitor.Wait(myLock, 5000);
-        locksDict.TryRemove(sprayId, out _);
+        TaskCompletionSource<byte[]> tcs = new();
+        pendingRequests.TryAdd(sprayId, tcs);
 
-        compressedSpraysCache.TryGetValue(sprayId, out byte[] compressedImageBytes);
-        if (compressedImageBytes == null)
+        try
         {
-            Plugin.Logger.LogInfo($"Download request for {sprayId} got null");
-            return null;
-        }
+            var netDataWriter = Net.CreateWriter(ClientDownloadMsg);
+            netDataWriter.Put(sprayId);
+            Plugin.Logger.LogInfo($"Sending download request for {sprayId}");
+            Net.Client_Send(DeliveryMethod.ReliableUnordered, netDataWriter);
 
-        var imageBytes = Deflate.DecompressData(compressedImageBytes);
-        if (imageBytes == null || imageBytes.Length == 0)
-        {
-            Plugin.Logger.LogInfo($"Download request for {sprayId} got bad data");
-            return null;
+            if (tcs.Task.Wait(TimeSpan.FromSeconds(10)))
+                return tcs.Task.Result;
+            else
+                return null;
         }
-        
-        Plugin.Logger.LogInfo($"Got spray {sprayId} (length: {imageBytes.Length}");
-        return imageBytes;
+        finally
+        {
+            pendingRequests.TryRemove(sprayId, out _);
+        }
     }
 
     private static void OnServerDownloadRequest(knetid id, ref NetDataReader reader)
@@ -250,48 +241,39 @@ public class NetworkController : MonoBehaviour
         if (sprayId == null || (sprayId = sprayId.Trim()).Length == 0)
         {
             Plugin.Logger.LogInfo($"Invalid spray {sprayId} from host: No sprayId");
-            // Download worker will have to timeout
             return;
         }
-
-        ExtractSentSpray(sprayId, ref reader);
         
-        Instance.locksDict.TryGetValue(sprayId, out var threadLock);
-        if (threadLock == null)
-            return;
-        lock (threadLock)
-            Monitor.Pulse(threadLock);
-        return;
-
-        static void ExtractSentSpray(string sprayId, ref NetDataReader reader)
+        reader.Get(out int compressedImageBytesLength);
+        if (compressedImageBytesLength <= 0)
         {
-            reader.Get(out int compressedImageBytesLength);
-            if (compressedImageBytesLength <= 0)
-            {
-                Plugin.Logger.LogInfo($"Invalid spray {sprayId} from host: No data");
-                return;
-            }
-            
-            var compressedImageBytes = new byte[compressedImageBytesLength];
-            reader.GetBytes(compressedImageBytes, compressedImageBytesLength);
-
-            if (Instance.compressedSpraysCache.ContainsKey(sprayId))
-            {
-                Plugin.Logger.LogInfo($"Duplicate spray {sprayId} from host");
-                return;
-            }
-
-            var imageBytes = Deflate.DecompressData(compressedImageBytes);
-            var recompressedImageBytes = Deflate.CompressData(imageBytes);
-            if (recompressedImageBytes == null || recompressedImageBytes.Length == 0)
-            {
-                Plugin.Logger.LogInfo($"Invalid spray {sprayId} from host: Bad image data");
-                return;
-            }
-            
-            Plugin.Logger.LogInfo($"Saving spray {sprayId} (length: {imageBytes.Length}) from host");
-            Instance.compressedSpraysCache.TryAdd(sprayId, compressedImageBytes);
+            Plugin.Logger.LogInfo($"Invalid spray {sprayId} from host: No data");
+            return;
         }
+        
+        var compressedImageBytes = new byte[compressedImageBytesLength];
+        reader.GetBytes(compressedImageBytes, compressedImageBytesLength);
+
+        if (Instance.compressedSpraysCache.ContainsKey(sprayId))
+        {
+            Plugin.Logger.LogInfo($"Duplicate spray {sprayId} from host");
+            return;
+        }
+        
+        var imageBytes = Deflate.DecompressData(compressedImageBytes);
+        var recompressedImageBytes = Deflate.CompressData(imageBytes);
+        if (recompressedImageBytes == null || recompressedImageBytes.Length == 0)
+        {
+            Plugin.Logger.LogInfo($"Invalid spray {sprayId} from host: Bad image data");
+            return;
+        }
+        
+        Plugin.Logger.LogInfo($"Saving spray {sprayId} (length: {imageBytes.Length}) from host");
+        
+        Instance.compressedSpraysCache.TryAdd(sprayId, compressedImageBytes);
+        
+        if (Instance.pendingRequests.TryRemove(sprayId, out var tcs))
+            tcs.SetResult(imageBytes);
     }
     
 }
