@@ -19,7 +19,7 @@ It allows you to change the maximum size, in bytes, of a spray that the server w
 
 #### Implementation Details
 
-Normally, CatPatch sends all of your sprays to an external sever from which all clients download the spray image from.
+Normally, CatPatch sends all of your sprays to an external sever from which all clients download the spray image.
 This server compresses PNGs when storing them, so there's no way to download the full resolution image.
 
 This mod allows clients to send the uncompressed image to the host directly.
