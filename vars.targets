@@ -1,0 +1,8 @@
+<Project>
+  <PropertyGroup>
+    <ProjectName>CatPatchFullResSprays</ProjectName>
+    <BaseGamePath>D:\Programs\Steam\steamapps\common\Casualties Unknown Demo</BaseGamePath>
+    <BepInExDir>$(BaseGamePath)/BepInEx</BepInExDir>
+    <GameAssembliesDir>$(BaseGamePath)/CasualtiesUnknown_Data/Managed</GameAssembliesDir>
+  </PropertyGroup>
+</Project>
