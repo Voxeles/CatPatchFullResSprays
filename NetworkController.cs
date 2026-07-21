@@ -243,37 +243,43 @@ public class NetworkController : MonoBehaviour
             Plugin.Logger.LogInfo($"Invalid spray {sprayId} from host: No sprayId");
             return;
         }
-        
-        reader.Get(out int compressedImageBytesLength);
-        if (compressedImageBytesLength <= 0)
-        {
-            Plugin.Logger.LogInfo($"Invalid spray {sprayId} from host: No data");
-            return;
-        }
-        
-        var compressedImageBytes = new byte[compressedImageBytesLength];
-        reader.GetBytes(compressedImageBytes, compressedImageBytesLength);
 
-        if (Instance.compressedSpraysCache.ContainsKey(sprayId))
+        byte[] imageBytes = null;
+        try
         {
-            Plugin.Logger.LogInfo($"Duplicate spray {sprayId} from host");
-            return;
-        }
+            reader.Get(out int compressedImageBytesLength);
+            if (compressedImageBytesLength <= 0)
+            {
+                Plugin.Logger.LogInfo($"Invalid spray {sprayId} from host: No data");
+                return;
+            }
         
-        var imageBytes = Deflate.DecompressData(compressedImageBytes);
-        var recompressedImageBytes = Deflate.CompressData(imageBytes);
-        if (recompressedImageBytes == null || recompressedImageBytes.Length == 0)
+            var compressedImageBytes = new byte[compressedImageBytesLength];
+            reader.GetBytes(compressedImageBytes, compressedImageBytesLength);
+
+            if (Instance.compressedSpraysCache.ContainsKey(sprayId))
+            {
+                Plugin.Logger.LogInfo($"Duplicate spray {sprayId} from host");
+                return;
+            }
+        
+            imageBytes = Deflate.DecompressData(compressedImageBytes);
+            var recompressedImageBytes = Deflate.CompressData(imageBytes);
+            if (recompressedImageBytes == null || recompressedImageBytes.Length == 0)
+            {
+                Plugin.Logger.LogInfo($"Invalid spray {sprayId} from host: Bad image data");
+                imageBytes = null;
+                return;
+            }
+        
+            Plugin.Logger.LogInfo($"Saving spray {sprayId} (length: {imageBytes.Length}) from host");
+            Instance.compressedSpraysCache.TryAdd(sprayId, compressedImageBytes);
+        }
+        finally
         {
-            Plugin.Logger.LogInfo($"Invalid spray {sprayId} from host: Bad image data");
-            return;
+            if (Instance.pendingRequests.TryRemove(sprayId, out var tcs))
+                tcs.SetResult(imageBytes);
         }
-        
-        Plugin.Logger.LogInfo($"Saving spray {sprayId} (length: {imageBytes.Length}) from host");
-        
-        Instance.compressedSpraysCache.TryAdd(sprayId, compressedImageBytes);
-        
-        if (Instance.pendingRequests.TryRemove(sprayId, out var tcs))
-            tcs.SetResult(imageBytes);
     }
     
 }
