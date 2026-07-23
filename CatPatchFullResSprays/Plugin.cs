@@ -15,7 +15,7 @@ public class Plugin : BaseUnityPlugin
 {
 	public const string ModGUID = "meowharder.catpatch.fullressprays";
 	public const string ModName = "CatPatchFullResSprays";
-	public const string ModVersion = "0.0.2";
+	public const string ModVersion = "0.0.3";
 	
 	public static Plugin Instance { get; private set; } = null!;
 

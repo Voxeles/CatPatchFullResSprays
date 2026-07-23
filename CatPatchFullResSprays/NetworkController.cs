@@ -1,27 +1,39 @@
 ﻿using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Threading.Tasks;
+using CatPatchspace;
 using UnityEngine;
 using KrokoshaCasualtiesMP;
 using LiteNetLib;
 using LiteNetLib.Utils;
 using UnityEngine.SceneManagement;
+using Object = UnityEngine.Object;
 
 namespace CatPatchFullResSprays;
 
 public class NetworkController : MonoBehaviour
 {
-    private const ushort ClientProbeMsg = 48000; 
-    private const ushort ServerProbeAckMsg = 48001;
-    private const ushort ClientUploadMsg = 48002;
-    private const ushort ClientDownloadMsg = 48003;
-    private const ushort ServerDownloadResponse = 48004;
+    private const ushort ClientProbeMsg = 48900; 
+    private const ushort ServerProbeAckMsg = 48901;
+    private const ushort ClientUploadMsg = 48902;
+    private const ushort ClientDownloadMsg = 48903;
+    private const ushort ServerDownloadResponse = 48904;
+    private const ushort ServerSprayUpdateMsg = 48905;
     
     public static NetworkController Instance { get; private set; }
 
     private static bool _handlersRegistered = false;
     private static bool _serverHasMod = false;
-    private ConcurrentDictionary<string, byte[]> compressedSpraysCache = [];
+
+    private sealed class SprayCacheEntry(byte[] compressedImageBytes, int uncompressedImageLength)
+    {
+        public byte[] compressedImageBytes = compressedImageBytes;
+        public int uncompressedImageLength = uncompressedImageLength;
+    };
+    
+    private ConcurrentDictionary<string, SprayCacheEntry> compressedSpraysCache = [];
+    private HashSet<string> missedSprays = [];
     private ConcurrentDictionary<string, TaskCompletionSource<byte[]>> pendingRequests = [];
 
     public void Awake()
@@ -65,6 +77,8 @@ public class NetworkController : MonoBehaviour
         _handlersRegistered = false;
         _serverHasMod = false;
         compressedSpraysCache.Clear();
+        missedSprays.Clear();
+        pendingRequests.Clear();
         Plugin.Logger.LogInfo("Reset session.");
     }
 
@@ -78,6 +92,7 @@ public class NetworkController : MonoBehaviour
         Net.RegisterServerReceiver(ClientUploadMsg, OnServerSprayReceived);
         Net.RegisterServerReceiver(ClientDownloadMsg, OnServerDownloadRequest);
         Net.RegisterClientReceiver(ServerDownloadResponse, OnClientSprayReceived);
+        Net.RegisterClientReceiver(ServerSprayUpdateMsg, OnClientSprayUpdate);
     }
     
     
@@ -119,7 +134,7 @@ public class NetworkController : MonoBehaviour
         if (compressedImageBytes == null)
             return;
 
-        compressedSpraysCache.TryAdd(sprayId, compressedImageBytes);
+        compressedSpraysCache.TryAdd(sprayId, new SprayCacheEntry(compressedImageBytes, imageBytes.Length));
 
         if (Net.is_host)
             return;
@@ -153,31 +168,119 @@ public class NetworkController : MonoBehaviour
         var compressedImageBytes = new byte[compressedImageBytesLength];
         reader.GetBytes(compressedImageBytes, compressedImageBytesLength);
 
-        if (Instance.compressedSpraysCache.ContainsKey(sprayId))
-        {
-            Plugin.Logger.LogInfo($"Duplicate spray {sprayId} from {id}");
-            return;
-        }
-
-        var imageData = Deflate.DecompressData(compressedImageBytes);
-        var recompressedImageData = Deflate.CompressData(imageData);
-        if (recompressedImageData == null || recompressedImageData.Length == 0)
+        var imageBytes = Deflate.DecompressData(compressedImageBytes);
+        var recompressedimageBytes = Deflate.CompressData(imageBytes);
+        if (recompressedimageBytes == null || recompressedimageBytes.Length == 0)
         {
             Plugin.Logger.LogInfo($"Invalid spray {sprayId} from {id}: Bad image data");
             return;
         }
-        if (imageData.Length > Plugin.Instance.ConfigMaxSpraySizeInBytes.Value)
+        if (imageBytes.Length > Plugin.Instance.ConfigMaxSpraySizeInBytes.Value)
         {
             Plugin.Logger.LogInfo($"Invalid spray {sprayId} from {id}: Image too big");
             return;
         }
+
+        var cacheUpdate = false;
+        if (Instance.compressedSpraysCache.TryGetValue(sprayId, out var cacheEntry))
+        {
+            Plugin.Logger.LogInfo($"Duplicate spray {sprayId} from {id}");
+            if (imageBytes.Length <= cacheEntry.uncompressedImageLength)
+                return;
+            Instance.compressedSpraysCache.TryRemove(sprayId, out _);
+            cacheUpdate = true;
+        }
+        else if (Instance.missedSprays.Contains(sprayId))
+        {
+            Plugin.Logger.LogInfo($"New spray {sprayId} from {id} previously missed");
+            cacheUpdate = true;
+        }
         
-        Plugin.Logger.LogInfo($"Saving spray {sprayId} (length: {imageData.Length}) from {id}");
-        Instance.compressedSpraysCache.TryAdd(sprayId, compressedImageBytes);
+        Plugin.Logger.LogInfo($"Saving spray {sprayId} (length: {imageBytes.Length}) from {id}");
+        Instance.compressedSpraysCache.TryAdd(sprayId, new SprayCacheEntry(compressedImageBytes, imageBytes.Length));
+        if (cacheUpdate)
+            SendCacheUpdate(sprayId, imageBytes.Length, compressedImageBytes);
     }
-    
-    
-    
+
+    private static void SendCacheUpdate(string sprayId, int uncompressedLength, byte[] compressedImageBytes)
+    {
+        Plugin.Logger.LogInfo("SendCacheUpdate");
+        
+        var netDataWriter = Net.CreateWriter(ServerSprayUpdateMsg);
+        netDataWriter.Put(sprayId);
+        netDataWriter.Put(uncompressedLength);
+        netDataWriter.Put(compressedImageBytes.Length);
+        netDataWriter.Put(compressedImageBytes);
+        Plugin.Logger.LogInfo($"Sending updated spray {sprayId} (length: {uncompressedLength})");
+        Net.Server_SendToClients(DeliveryMethod.ReliableUnordered, netDataWriter, ServerMain.AllClientIds);
+    }
+
+    private static void OnClientSprayUpdate(knetid id, ref NetDataReader reader)
+    {
+        Plugin.Logger.LogInfo("OnClientSprayUpdate");
+        
+        reader.Get(out string sprayId);
+        if (sprayId == null || (sprayId = sprayId.Trim()).Length == 0)
+        {
+            Plugin.Logger.LogInfo($"Invalid spray from host: No sprayId");
+            return;
+        }
+
+        reader.Get(out int uncompressedImageBytesLength);
+        if (uncompressedImageBytesLength <= 0)
+        {
+            Plugin.Logger.LogInfo($"Ignoring spray from host: Bad length");
+            return;
+        }
+        
+        reader.Get(out int compressedImageBytesLength);
+        if (compressedImageBytesLength <= 0)
+        {
+            Plugin.Logger.LogInfo($"Invalid spray from {id}: Bad length");
+            return;
+        }
+        
+        var compressedImageBytes = new byte[compressedImageBytesLength];
+        reader.GetBytes(compressedImageBytes, compressedImageBytesLength);
+
+        var imageBytes = Deflate.DecompressData(compressedImageBytes);
+        var recompressedimageBytes = Deflate.CompressData(imageBytes);
+        if (recompressedimageBytes == null || recompressedimageBytes.Length == 0)
+        {
+            Plugin.Logger.LogInfo($"Invalid spray {sprayId} from {id}: Bad image data");
+            return;
+        }
+
+        var sprayController = CatPatchspace.Plugin.Instance.gameObject.GetComponent<SprayController>();
+        if (sprayController == null)
+        {
+            Plugin.Logger.LogInfo($"No spray controller!");
+            return;
+        }
+        var uploadQueue = sprayController._uploadQueue;
+        var downloadCache = sprayController._networkController._downloadCache;
+        
+        lock (uploadQueue._lock)
+        lock (downloadCache._lock)
+        {
+            Instance.compressedSpraysCache[sprayId] = new SprayCacheEntry(compressedImageBytes, imageBytes.Length);
+            
+            downloadCache._cachedBytes[sprayId] = imageBytes;
+            
+            var sprayInstances = Object.FindObjectsByType<SprayInstance>(FindObjectsSortMode.None);
+            foreach (var sprayInstance in sprayInstances)
+            {
+                if (!sprayInstance.SprayId.Equals(sprayId))
+                    continue;
+                sprayInstance.ImageBytes = imageBytes;
+                sprayController._visualController.TryGetOrCreateSprite(sprayId, imageBytes, out var sprite, out _);
+                sprayInstance.Renderer.sprite = sprite;
+            }
+        }
+    }
+
+
+    // Called from a worker thread, OK to block
     public byte[] TryDownloadSpray(string sprayId)
     {
         Plugin.Logger.LogInfo($"TryDownloadSpray {sprayId}");
@@ -187,8 +290,8 @@ public class NetworkController : MonoBehaviour
         if (sprayId == null || (sprayId = sprayId.Trim()).Length == 0)
             return null;
         
-        if (compressedSpraysCache.TryGetValue(sprayId, out byte[] cachedCompressedImageBytes))
-            return Deflate.DecompressData(cachedCompressedImageBytes);
+        if (compressedSpraysCache.TryGetValue(sprayId, out var cacheEntry))
+            return Deflate.DecompressData(cacheEntry.compressedImageBytes);
         
         if (Net.is_host)
             return null;
@@ -203,7 +306,7 @@ public class NetworkController : MonoBehaviour
             Plugin.Logger.LogInfo($"Sending download request for {sprayId}");
             Net.Client_Send(DeliveryMethod.ReliableUnordered, netDataWriter);
 
-            if (tcs.Task.Wait(TimeSpan.FromSeconds(10)))
+            if (tcs.Task.Wait(TimeSpan.FromSeconds(5)))
                 return tcs.Task.Result;
             else
                 return null;
@@ -222,7 +325,10 @@ public class NetworkController : MonoBehaviour
         sprayId ??= "";
         sprayId = sprayId.Trim();
 
-        Instance.compressedSpraysCache.TryGetValue(sprayId, out byte[] compressedImageBytes);
+        Instance.compressedSpraysCache.TryGetValue(sprayId, out var cacheEntry);
+        if (cacheEntry == null)
+            Instance.missedSprays.Add(sprayId);
+        var compressedImageBytes = cacheEntry?.compressedImageBytes;
         compressedImageBytes ??= [];
         
         var netDataWriter = Net.CreateWriter(ServerDownloadResponse);
@@ -273,7 +379,7 @@ public class NetworkController : MonoBehaviour
             }
         
             Plugin.Logger.LogInfo($"Saving spray {sprayId} (length: {imageBytes.Length}) from host");
-            Instance.compressedSpraysCache.TryAdd(sprayId, compressedImageBytes);
+            Instance.compressedSpraysCache.TryAdd(sprayId, new SprayCacheEntry(compressedImageBytes, imageBytes.Length));
         }
         finally
         {
@@ -281,5 +387,4 @@ public class NetworkController : MonoBehaviour
                 tcs.SetResult(imageBytes);
         }
     }
-    
 }
