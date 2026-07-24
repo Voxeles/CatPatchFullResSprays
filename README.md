@@ -6,6 +6,7 @@ Allows you to view and download other player's sprays in full resolution.
 Both the host and the client must have this mod installed for this to work.
 
 NOTE: This mod is still in development! There might be bugs!
+It doesn't have any clever cache flushing nor OOM prevention - it is not recommeneded to use this mod on long-running dedicated servers.
 
 #### Installation
 
