@@ -1,12 +1,12 @@
-### A simple mod for CatPatch for viewing full resolution sprays
+### An unofficial mod for CatPatch for viewing full resolution sprays
 
 CatPatch: https://www.nexusmods.com/scavprototype/mods/69
 
 Allows you to view and download other player's sprays in full resolution.
 Both the host and the client must have this mod installed for this to work.
 
-NOTE: This mod is still in development! There might be bugs!
-It doesn't have any clever cache flushing nor OOM prevention - it is not recommended to use this mod on long-running dedicated servers.
+**NOTE**: This mod is still in development! There will be bugs!
+It doesn't have any clever cache flushing nor OOM prevention - it is *not* recommended to use this mod on long-running dedicated servers!
 
 #### Installation
 
