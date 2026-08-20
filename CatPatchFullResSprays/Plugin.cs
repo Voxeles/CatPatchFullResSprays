@@ -15,7 +15,7 @@ public class Plugin : BaseUnityPlugin
 {
 	public const string ModGUID = "meowharder.catpatch.fullressprays";
 	public const string ModName = "CatPatchFullResSprays";
-	public const string ModVersion = "0.0.3";
+	public const string ModVersion = "0.0.4";
 	
 	public static Plugin Instance { get; private set; } = null!;
 
@@ -23,6 +23,7 @@ public class Plugin : BaseUnityPlugin
 
 	private readonly Harmony _harmony = new(ModGUID);
 
+	public ConfigEntry<bool> ConfigShowSpraysOnMainMenu;
 	public ConfigEntry<int> ConfigMaxSpraySizeInBytes;
 
 	void Awake()
@@ -30,11 +31,18 @@ public class Plugin : BaseUnityPlugin
 		Instance = this;
 		Logger = base.Logger;
 
+		ConfigShowSpraysOnMainMenu = Config.Bind(
+			"Client",
+			"showSpraysOnMainMenu",
+			false,
+			"Whenever to show sprays on the main menu");
 		ConfigMaxSpraySizeInBytes = Config.Bind(
-			"General",
+			"Server",
 			"maxSpraySizeInBytes",
 			10 * 1024 * 1024,
 			"Maximum size, in bytes, that a spray image can have.\nThe server will not store sprays above this limit.\nDefaults to 10MB.");
+		
+		MainMenuSpraysData.ShowSpraysOnMainMenu = ConfigShowSpraysOnMainMenu.Value;
 		
 		_harmony.PatchAll();
 		gameObject.AddComponent<NetworkController>();
