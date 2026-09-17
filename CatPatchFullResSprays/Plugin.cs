@@ -1,27 +1,23 @@
-﻿using System.Collections;
-using BepInEx;
+﻿using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using HarmonyLib;
-using KrokoshaCasualtiesMP;
-using UnityEngine;
-using UnityEngine.SceneManagement;
 
 namespace CatPatchFullResSprays;
 
-[BepInPlugin(ModGUID, ModName, ModVersion)]
+[BepInPlugin(MyPluginInfo.PLUGIN_GUID, MyPluginInfo.PLUGIN_NAME, MyPluginInfo.PLUGIN_VERSION)]
 [BepInDependency("meow.catpatch")]
 public class Plugin : BaseUnityPlugin
 {
-	public const string ModGUID = "meowharder.catpatch.fullressprays";
-	public const string ModName = "CatPatchFullResSprays";
-	public const string ModVersion = "0.0.4";
+	public const string ModGuid = MyPluginInfo.PLUGIN_GUID;
+	public const string ModName = MyPluginInfo.PLUGIN_NAME;
+	public const string ModVersion = MyPluginInfo.PLUGIN_VERSION;
 	
 	public static Plugin Instance { get; private set; } = null!;
 
 	internal new static ManualLogSource Logger { get; private set; }
 
-	private readonly Harmony _harmony = new(ModGUID);
+	private readonly Harmony _harmony = new(ModGuid);
 
 	public ConfigEntry<bool> ConfigShowSpraysOnMainMenu;
 	public ConfigEntry<int> ConfigMaxSpraySizeInBytes;

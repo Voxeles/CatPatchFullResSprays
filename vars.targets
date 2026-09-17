@@ -1,8 +1,6 @@
 <Project>
   <PropertyGroup>
 
-    <ProjectName>CatPatchFullResSprays</ProjectName>
-
 
     <!--If auto-detection misses your install, set this to your game folder.-->
     <!-- E.g. <ManualBaseGamePath>C:\Some\Path\To\Your\Game\Folder</ManualBaseGamePath> -->
