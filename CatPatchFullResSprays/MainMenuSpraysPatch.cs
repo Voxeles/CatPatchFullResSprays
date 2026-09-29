@@ -20,9 +20,16 @@ internal static class MainMenuSpraysData
         {
             if (value == ShowSpraysOnMainMenu)
                 return;
+
             Plugin.Instance.ConfigShowSpraysOnMainMenu.Value = value;
+
             CleanupDict();
-            foreach (var spray in SprayNetworkController._instance._visualController._activeSprays)
+
+            var activeSprays = SprayNetworkController._instance?._visualController?._activeSprays;
+            if (activeSprays == null)
+                return;
+
+            foreach (var spray in activeSprays)
             {
                 if (spray == null)
                     continue;
@@ -33,7 +40,10 @@ internal static class MainMenuSpraysData
 
     public static void CleanupDict()
     {
-        var activeSprays = SprayNetworkController._instance._visualController._activeSprays;
+        var activeSprays = SprayNetworkController._instance?._visualController._activeSprays;
+        if (activeSprays == null)
+            return;
+
         foreach (var pair in _sprayToUiObjectDict.ToList())
         {
             if (pair.Key != null && activeSprays.Contains(pair.Key.gameObject))
@@ -41,6 +51,28 @@ internal static class MainMenuSpraysData
             _sprayToUiObjectDict.Remove(pair.Key);
             Object.Destroy(pair.Value);
         }
+    }
+
+    public static void Reset()
+    {
+        foreach (var obj in _sprayToUiObjectDict.Values)
+        {
+            if (obj == null)
+                continue;
+            Object.Destroy(obj);
+        }
+        _sprayToUiObjectDict.Clear();
+    }
+
+    public static void RefreshSpray(SprayInstance spray)
+    {
+        if (_sprayToUiObjectDict.TryGetValue(spray, out var obj))
+        {
+            _sprayToUiObjectDict.Remove(spray);
+            Object.Destroy(obj);
+        }
+        if (KrokoshaCasualtiesUtils.Util.IsInMainMenu())
+            UpdateSpray(spray, ShowSpraysOnMainMenu);
     }
     
     private static void InitTemplateUiObject()
@@ -57,7 +89,7 @@ internal static class MainMenuSpraysData
 
     public static void UpdateSpray(SprayInstance spr, bool show)
     {
-        if (!KrokoshaCasualtiesUtils.Util.IsInMainMenu())
+        if (!KrokoshaCasualtiesUtils.Util.IsInMainMenu() || spr == null || PreRunScript.instance == null || Camera.main == null)
             return;
         
         if (_sprayToUiObjectDict.TryGetValue(spr, out GameObject uiObj))

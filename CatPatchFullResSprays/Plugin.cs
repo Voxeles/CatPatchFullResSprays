@@ -20,7 +20,12 @@ public class Plugin : BaseUnityPlugin
 	private readonly Harmony _harmony = new(ModGuid);
 
 	public ConfigEntry<bool> ConfigShowSpraysOnMainMenu;
-	public ConfigEntry<int> ConfigMaxSpraySizeInBytes;
+	public ConfigEntry<int> ConfigMaxSpraySizeMiB;
+	public ConfigEntry<int> ConfigMemoryCacheMiB;
+	public ConfigEntry<int> ConfigDiskCacheMiB;
+	public ConfigEntry<bool> ConfigClearDiskCacheOnExit;
+	public ConfigEntry<bool> ConfigRequireBackend;
+	public ConfigEntry<bool> ConfigVerbose;
 
 	void Awake()
 	{
@@ -30,18 +35,46 @@ public class Plugin : BaseUnityPlugin
 		ConfigShowSpraysOnMainMenu = Config.Bind(
 			"Client",
 			"showSpraysOnMainMenu",
-			false,
-			"Whenever to show sprays on the main menu");
-		ConfigMaxSpraySizeInBytes = Config.Bind(
+			true,
+			"Display sprays on the main menu");
+		ConfigMemoryCacheMiB = Config.Bind(
+			"Cache",
+			"memoryCacheMiB",
+			64,
+			new ConfigDescription("Maximum byte size for the RAM cache (Restart to apply)",
+				new AcceptableValueRange<int>(11, 4096)));
+		ConfigDiskCacheMiB = Config.Bind(
+			"Cache",
+			"diskCacheMiB",
+			1024,
+			new ConfigDescription("Maximum byte size for the on-disk cache (Restart to apply)",
+				new AcceptableValueRange<int>(0, 10240)));
+		ConfigClearDiskCacheOnExit = Config.Bind(
+			"Cache",
+			"clearDiskCacheOnExit",
+			true,
+			"Delete cached downloads on game exit.\nThis is about the on-disk cache located in 'BepInEx/config/Cat-Patch/FullResSprays-cache' - Your spray library is never deleted");
+		ConfigRequireBackend = Config.Bind(
 			"Server",
-			"maxSpraySizeInBytes",
-			10 * 1024 * 1024,
-			"Maximum size, in bytes, that a spray image can have.\nThe server will not store sprays above this limit.\nDefaults to 10MB.");
+			"requireBackendUpload",
+			false,
+			"Only accept uploads reported by the client as successfully uploaded to CatPatch's HTTP backend (Restart session to apply)");
+		ConfigMaxSpraySizeMiB = Config.Bind(
+			"Server",
+			"maxSpraySizeMiB",
+			10,
+			new ConfigDescription("Maximum image file size accepted by the host (Restart session to apply)",
+				new AcceptableValueRange<int>(1, SprayImage.HardByteSizeLimit / 1024 / 1024)));
+		ConfigVerbose = Config.Bind(
+			"Debug",
+			"verboseMode",
+			false,
+			"Print info messages to debug console");
 		
 		MainMenuSpraysData.ShowSpraysOnMainMenu = ConfigShowSpraysOnMainMenu.Value;
 		
-		_harmony.PatchAll();
 		gameObject.AddComponent<NetworkController>();
+		_harmony.PatchAll();
 		
 		Logger.LogInfo($"{ModName} is loaded.");
 	}
@@ -50,5 +83,11 @@ public class Plugin : BaseUnityPlugin
 	{
 		_harmony?.UnpatchSelf();
 		Instance = null!;
+	}
+
+	internal static void LogVerbose(string message)
+	{
+		if (Instance.ConfigVerbose.Value)
+			Logger.LogInfo(message);
 	}
 }
