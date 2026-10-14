@@ -453,8 +453,13 @@ public sealed class NetworkController : MonoBehaviour
             string version = reader.GetString(64);
             string session = reader.GetString(32);
 
-            if (protocol != ProtocolVersion
-                || string.IsNullOrEmpty(version)
+            if (protocol != ProtocolVersion)
+            {
+                // for later
+                // If not compatible, return protocol version -1
+            }
+
+            if (string.IsNullOrEmpty(version)
                 || session.Length != 32
                 || !SprayImage.IsValidId(session))
             {
@@ -471,7 +476,7 @@ public sealed class NetworkController : MonoBehaviour
             Instance._peers.Add(peer.id);
             Instance._peerSessions[peer.id] = session;
             var writer = Multiplayer.CreateNamedWriter(ProbeAck);
-            writer.Put(protocol);
+            writer.Put(ProtocolVersion);
             writer.Put(Plugin.ModVersion);
             writer.Put(session);
             writer.Put(Instance.HostMaxSize);
@@ -493,13 +498,17 @@ public sealed class NetworkController : MonoBehaviour
 
         try
         {
-            if (reader.GetInt() != ProtocolVersion)
+            var protocol = reader.GetInt();
+            var modVersion = reader.GetString(64);
+
+            if (protocol == -1)
             {
-                Plugin.LogVerbose($"ReceiveProbeAck: Wrong protocol");
+                var message = $"FullResSprays disabled: Your version {Plugin.ModVersion} is incompatible with host's {modVersion}";
+                Con.con?.LogToConsole(message);
+                SprayService.Alert(message);
                 return;
             }
 
-            reader.GetString(64);
             if (reader.GetString(32) != Instance._helloToken)
             {
                 Plugin.LogVerbose($"ReceiveProbeAck: Not my token. Expected: {Instance._helloToken}");
