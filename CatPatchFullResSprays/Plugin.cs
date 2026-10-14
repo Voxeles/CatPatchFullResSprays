@@ -41,13 +41,13 @@ public class Plugin : BaseUnityPlugin
 			"Cache",
 			"memoryCacheMiB",
 			64,
-			new ConfigDescription("Maximum byte size for the RAM cache",
+			new ConfigDescription("Maximum size for the RAM cache",
 				new AcceptableValueRange<int>(11, 4096)));
 		ConfigDiskCacheMiB = Config.Bind(
 			"Cache",
 			"diskCacheMiB",
 			1024,
-			new ConfigDescription("Maximum byte size for the on-disk cache",
+			new ConfigDescription("Maximum size for the on-disk cache",
 				new AcceptableValueRange<int>(0, 10240)));
 		ConfigClearDiskCacheOnExit = Config.Bind(
 			"Cache",
