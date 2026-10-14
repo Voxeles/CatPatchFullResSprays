@@ -21,6 +21,18 @@ public sealed class NetworkController : MonoBehaviour
     private const int MaxTransfers = 16;
     private const long TransferBudget = 64L * 1024 * 1024;
     private const float TransferInterval = 0.025f;
+    private const float TransferIdleTimeout = 30;
+    private const float TransferTimeout = 180;
+    private const int MaxPreparing = 2;
+    private const int MaxServesPerPeer = 2;
+    private const int MaxQueued = 64;
+    private const int MaxQueuedPerPeer = MaxTransfers;
+    private const float QueueExpiry = 15;
+    private const int MaxInspecting = 4;
+    private const float MinBackoff = 0.25f;
+    private const float MaxBackoff = 4;
+    private const float DownloadIdleTimeout = 30;
+    private const float DownloadTimeout = 600;
 
     public static NetworkController Instance { get; private set; }
     internal SprayService Service { get; private set; }
@@ -39,6 +51,8 @@ public sealed class NetworkController : MonoBehaviour
     private readonly Dictionary<string, Download> _downloads = [];
     private readonly Dictionary<string, Receipt> _receipts = [];
     private readonly HashSet<string> _preparing = [];
+    private readonly List<Request> _queue = [];
+    private readonly HashSet<string> _inspecting = [];
     private bool _closed;
     private float _lastProbe = float.NegativeInfinity;
     private float _nextSend;
@@ -53,6 +67,7 @@ public sealed class NetworkController : MonoBehaviour
         Get, // Give me this image
         Inspect, // What do you know about this image (size)?
         Notice, // Here's what I know about this image
+        Wait, // I'm busy, ask again later
     }
 
     private sealed class Outgoing
@@ -62,6 +77,8 @@ public sealed class NetworkController : MonoBehaviour
         public SprayImage Image;
         public int Index = -1;
         public float SentTime = float.NegativeInfinity;
+        public float RetryAt = float.NegativeInfinity;
+        public int Waits;
         public float Progress = Time.realtimeSinceStartup;
         public readonly float Started = Time.realtimeSinceStartup;
         public readonly TaskCompletionSource<bool> Completion = NewCompletion<bool>();
@@ -85,9 +102,20 @@ public sealed class NetworkController : MonoBehaviour
     {
         public string Id;
         public readonly float Started = Time.realtimeSinceStartup;
-        public float Sent = float.NegativeInfinity;
+        public float LastActivity = Time.realtimeSinceStartup;
+        public float NextGet = float.NegativeInfinity;
+        public int Waits;
         public bool Receiving;
         public readonly TaskCompletionSource<SprayImage> Completion = NewCompletion<SprayImage>();
+    }
+
+    private sealed class Request
+    {
+        public ushort Peer;
+        public string Token;
+        public string Id;
+        public int Size = -1;
+        public float Seen = Time.realtimeSinceStartup;
     }
 
     private sealed class Receipt
@@ -105,6 +133,12 @@ public sealed class NetworkController : MonoBehaviour
     private static string Key(ushort peer, string token)
     {
         return peer + ":" + token;
+    }
+
+    private static float Backoff(int waits)
+    {
+        float delay = Mathf.Min(MaxBackoff, MinBackoff * (1 << Mathf.Clamp(waits, 0, 5)));
+        return delay * UnityEngine.Random.Range(0.75f, 1.25f);
     }
 
     private void Awake()
@@ -149,6 +183,9 @@ public sealed class NetworkController : MonoBehaviour
             _incoming.Remove(key);
         foreach (string key in _preparing.Where(k => k.StartsWith(peer + ":", StringComparison.Ordinal)).ToArray())
             _preparing.Remove(key);
+        foreach (string key in _inspecting.Where(k => k.StartsWith(peer + ":", StringComparison.Ordinal)).ToArray())
+            _inspecting.Remove(key);
+        _queue.RemoveAll(r => r.Peer == peer);
         foreach (string key in _receipts.Keys.Where(k => k.StartsWith(peer + ":", StringComparison.Ordinal)).ToArray())
             _receipts.Remove(key);
     }
@@ -210,10 +247,16 @@ public sealed class NetworkController : MonoBehaviour
             }
         }
 
+        if (_queue.Count > 0)
+        {
+            _queue.RemoveAll(r => now - r.Seen > QueueExpiry);
+            PumpQueue();
+        }
+
         foreach (KeyValuePair<string, Outgoing> pair in _outgoing.OrderBy(p => p.Value.SentTime).ToArray())
         {
             var item = pair.Value;
-            if (now - item.Progress > 30 || now - item.Started > 180)
+            if (now - item.Progress > TransferIdleTimeout || now - item.Started > TransferTimeout)
             {
                 Plugin.LogVerbose($"NetworkController: Update: Outgoing: timed out id={item.Image.Id}");
                 FinishOutgoing(pair.Key, false);
@@ -221,6 +264,7 @@ public sealed class NetworkController : MonoBehaviour
             }
 
             if (now < _nextSend // Transfer interval
+                || now < item.RetryAt // Receiver asked us to wait
                 || now - item.SentTime < 5) // Retransmit fragment if no ACK (Next or Result) after a while
                 continue;
 
@@ -240,7 +284,7 @@ public sealed class NetworkController : MonoBehaviour
 
         foreach (KeyValuePair<string, Incoming> pair in _incoming.ToArray())
         {
-            if ((now - pair.Value.Progress > 30 || now - pair.Value.Started > 180) && !pair.Value.Saving)
+            if ((now - pair.Value.Progress > TransferIdleTimeout || now - pair.Value.Started > TransferTimeout) && !pair.Value.Saving)
             {
                 Plugin.LogVerbose($"NetworkController: Update: Incoming: timed out id={pair.Key}");
                 _incoming.Remove(pair.Key);
@@ -257,7 +301,7 @@ public sealed class NetworkController : MonoBehaviour
         foreach (KeyValuePair<string, Download> pair in _downloads.ToArray())
         {
             var item = pair.Value;
-            if (now - item.Started > 180)
+            if (!item.Receiving && now - item.LastActivity > DownloadIdleTimeout || now - item.Started > DownloadTimeout)
             {
                 Plugin.LogVerbose($"NetworkController: Update: Download: timed out id={pair.Key}");
                 _downloads.Remove(pair.Key);
@@ -266,10 +310,10 @@ public sealed class NetworkController : MonoBehaviour
                 continue;
             }
 
-            if (!item.Receiving && now - item.Sent > 2)
+            if (!item.Receiving && now >= item.NextGet)
             {
                 Plugin.LogVerbose($"NetworkController: Update: Download: Sending get for id={item.Id}");
-                item.Sent = now;
+                item.NextGet = now + 2;
                 Send(0, Kind.Get, w =>
                 {
                     w.Put(pair.Key);
@@ -427,7 +471,7 @@ public sealed class NetworkController : MonoBehaviour
             Instance._peers.Add(peer.id);
             Instance._peerSessions[peer.id] = session;
             var writer = Multiplayer.CreateNamedWriter(ProbeAck);
-            writer.Put(ProtocolVersion);
+            writer.Put(protocol);
             writer.Put(Plugin.ModVersion);
             writer.Put(session);
             writer.Put(Instance.HostMaxSize);
@@ -606,6 +650,23 @@ public sealed class NetworkController : MonoBehaviour
                     }
 
                     break;
+                case Kind.Wait:
+                    Plugin.LogVerbose($"NetworkController: Receive: Wait");
+                    float waitNow = Time.realtimeSinceStartup;
+                    if (_outgoing.TryGetValue(key, out var waiting))
+                    {
+                        waiting.Progress = waitNow;
+                        waiting.SentTime = float.NegativeInfinity;
+                        waiting.RetryAt = waitNow + Backoff(waiting.Waits++);
+                    }
+
+                    if (!IsHost && _downloads.TryGetValue(token, out var pending) && !pending.Receiving)
+                    {
+                        pending.LastActivity = waitNow;
+                        pending.NextGet = waitNow + Backoff(pending.Waits++);
+                    }
+
+                    break;
                 case Kind.Result:
                     bool success = reader.GetBool();
                     string message = reader.GetString(256);
@@ -670,6 +731,8 @@ public sealed class NetworkController : MonoBehaviour
                 return;
             if (!IsHost && (!_downloads.TryGetValue(token, out var expected) || expected.Id != id))
                 return;
+            if (!IsHost)
+                _downloads[token].LastActivity = Time.realtimeSinceStartup;
 
             if (size <= 0
                 || size > SprayImage.HardByteSizeLimit
@@ -692,7 +755,8 @@ public sealed class NetworkController : MonoBehaviour
                 || _incoming.Values.Count(t => t.Peer == peer) >= 2
                 || _incoming.Values.Sum(t => (long)t.Buffer.Bytes.Length) + size > TransferBudget)
             {
-                Result(peer, token, false, "Host is busy receiving images.");
+                Plugin.LogVerbose($"NetworkController: Offer: Busy, asking to wait");
+                SendWait(peer, token);
                 return;
             }
 
@@ -800,33 +864,90 @@ public sealed class NetworkController : MonoBehaviour
         }
     }
 
-    private async void Serve(ushort peer, string token, string id)
+    private void Serve(ushort peer, string token, string id)
     {
         Plugin.LogVerbose($"NetworkController: Serve: peer={peer}, id={id}");
         string key = Key(peer, token);
         if (_outgoing.ContainsKey(key) || _preparing.Contains(key))
             return;
 
-        if (_preparing.Count >= 2 || _outgoing.Values.Count(t => t.Peer == peer) >= 2)
+        var request = _queue.Find(r => r.Peer == peer && r.Token == token);
+        if (request == null)
         {
-            Result(peer, token, false, "Host is busy.");
-            return;
+            if (_queue.Count >= MaxQueued || _queue.Count(r => r.Peer == peer) >= MaxQueuedPerPeer)
+            {
+                Plugin.LogVerbose($"NetworkController: Serve: Queue full");
+                SendWait(peer, token);
+                return;
+            }
+
+            request = new Request { Peer = peer, Token = token, Id = id };
+            _queue.Add(request);
         }
 
+        request.Seen = Time.realtimeSinceStartup;
+        PumpQueue();
+        if (_queue.Contains(request))
+        {
+            Plugin.LogVerbose($"NetworkController: Serve: Queued at {_queue.IndexOf(request)}");
+            SendWait(peer, token);
+        }
+    }
+
+    private int ServesFor(ushort peer)
+    {
+        string prefix = peer + ":";
+        return _outgoing.Values.Count(t => t.Peer == peer) + _preparing.Count(k => k.StartsWith(prefix, StringComparison.Ordinal));
+    }
+
+    private void PumpQueue()
+    {
+        for (int i = 0; i < _queue.Count;)
+        {
+            if (_preparing.Count > MaxPreparing || _outgoing.Count + _preparing.Count > MaxTransfers)
+                break;
+
+            var request = _queue[i];
+            if (ServesFor(request.Peer) >= MaxServesPerPeer || request.Size >= 0 && !CanSend(request.Size))
+            {
+                i++;
+                continue;
+            }
+
+            _queue.RemoveAt(i);
+            StartServe(request);
+        }
+    }
+
+    private async void StartServe(Request request)
+    {
+        ushort peer = request.Peer;
+        string token = request.Token;
+        string key = Key(peer, token);
         _preparing.Add(key);
         int generation = _generation;
         _peerSessions.TryGetValue(peer, out string session);
         try
         {
             Plugin.LogVerbose($"NetworkController: Serve: Reading image");
-            var image = await Service.ReadAsync(id);
+            var image = await Service.ReadAsync(request.Id);
             if (!SameSession(generation, peer, session))
                 return;
 
             Plugin.LogVerbose($"NetworkController: Serve: Image check");
-            if (image == null || !CanSend(image.Bytes.Length))
+            if (image == null)
             {
                 Result(peer, token, false, "Image is unavailable on the host.");
+                return;
+            }
+
+            if (!CanSend(image.Bytes.Length))
+            {
+                Plugin.LogVerbose($"NetworkController: Serve: Over budget, requeueing");
+                request.Size = image.Bytes.Length;
+                request.Seen = Time.realtimeSinceStartup;
+                _queue.Insert(0, request);
+                SendWait(peer, token);
                 return;
             }
 
@@ -892,6 +1013,11 @@ public sealed class NetworkController : MonoBehaviour
         Result(peer, token, success, message);
     }
 
+    private void SendWait(ushort peer, string token)
+    {
+        Send(peer, Kind.Wait, w => w.Put(token));
+    }
+
     private void Result(ushort peer, string token, bool success, string message)
     {
         message ??= "";
@@ -909,8 +1035,8 @@ public sealed class NetworkController : MonoBehaviour
     {
         Plugin.LogVerbose($"NetworkController: SendNotice peer={peer}, id={id}");
         int generation = _generation;
-        string key = peer + ":inspect:" + id;
-        if (_preparing.Count >= 2 || !_preparing.Add(key))
+        string key = peer + ":" + id;
+        if (_inspecting.Count >= MaxInspecting || !_inspecting.Add(key))
             return;
 
         _peerSessions.TryGetValue(peer, out string session);
@@ -930,7 +1056,7 @@ public sealed class NetworkController : MonoBehaviour
         finally
         {
             if (SameSession(generation, peer, session))
-                _preparing.Remove(key);
+                _inspecting.Remove(key);
         }
     }
 
@@ -1018,6 +1144,8 @@ public sealed class NetworkController : MonoBehaviour
         _downloads.Clear();
         _receipts.Clear();
         _preparing.Clear();
+        _queue.Clear();
+        _inspecting.Clear();
         _peers.Clear();
         _peerSessions.Clear();
         _helloToken = Guid.NewGuid().ToString("N");

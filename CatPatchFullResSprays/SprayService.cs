@@ -322,7 +322,7 @@ internal sealed class SprayService
                 if (scene != _scene)
                     return;
                 
-                Plugin.LogVerbose($"SprayService: CacheUpdated: Got from host of size {image.Bytes.Length / 1024}KiB");
+                Plugin.LogVerbose($"SprayService: CacheUpdated: Got from host of size {image?.Bytes.Length / 1024}KiB");
                 if (image == null || image.Bytes.Length < requested)
                     throw new IOException("The host could not provide the announced image.");
 
