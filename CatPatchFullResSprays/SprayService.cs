@@ -440,31 +440,31 @@ internal sealed class SprayService
         _inspected.Clear();
         _checking.Clear();
         _updates.Clear();
-        _renderedSizes.Clear();
+        MainMenuSpraysData.Reset();
+    }
 
-        var plugin = CatPatchspace.Plugin.Instance;
-        if (plugin == null)
-            return;
+    internal void TrimCatPatchCaches()
+    {
+        Plugin.LogVerbose($"SprayService: TrimCatPatchCaches");
+        _renderedSizes.Clear();
 
         foreach (var sprite in _retiredSprites)
             DestroySpriteAndTexture(sprite);
         _retiredSprites.Clear();
 
-        MainMenuSpraysData.Reset();
+        var plugin = CatPatchspace.Plugin.Instance;
+        if (plugin == null)
+            return;
 
-        // Free CatPatch's cached data
         var controller = plugin.GetComponent<SprayController>();
         if (controller != null)
         {
-            controller._networkController.ClearLayerState();
-            controller._visualController.ClearActiveSprays();
-
             foreach (var sprite in controller._visualController._spriteCache.Values)
                 DestroySpriteAndTexture(sprite);
             controller._visualController._spriteCache.Clear();
 
             foreach (var texture in controller._previewTextureCache.Values)
-                    Object.Destroy(texture);
+                Object.Destroy(texture);
             controller._previewTextureCache.Clear();
 
             lock (controller._uploadQueue._lock)
@@ -483,7 +483,6 @@ internal sealed class SprayService
                 gif?.DestroyTextures();
             inspector._gifAnimationCache.Clear();
             inspector._failedGifCacheKeys.Clear();
-            inspector._sprayCache.Clear();
         }
     }
 

@@ -68,6 +68,42 @@ internal static class Patches
         NetworkController.Instance?.Service.PrepareSprite(__instance, cacheKey, imageBytes);
     }
 
+    [HarmonyPatch(typeof(SprayNetworkController), nameof(SprayNetworkController.ClearLayerState))]
+    [HarmonyPostfix]
+    private static void TrimCachesOnLayerChangePatch()
+    {
+        NetworkController.Instance?.Service.TrimCatPatchCaches();
+    }
+
+    // Mark spray textures as unreadable to unload them from RAM
+    private static void MakeNonReadable(Texture2D texture)
+    {
+        if (texture != null && texture.isReadable)
+            texture.Apply(false, true);
+    }
+
+    [HarmonyPatch(typeof(SprayVisualController), nameof(SprayVisualController.TryGetOrCreateSprite))]
+    [HarmonyPostfix]
+    private static void SpriteNonReadablePatch(bool __result, ref Sprite sprite)
+    {
+        if (__result && sprite != null)
+            MakeNonReadable(sprite.texture);
+    }
+
+    [HarmonyPatch(typeof(SprayController), nameof(SprayController.CreateStaticTexture))]
+    [HarmonyPostfix]
+    private static void PreviewNonReadablePatch(Texture2D __result)
+    {
+        MakeNonReadable(__result);
+    }
+
+    [HarmonyPatch(typeof(GifAnimationDecoder), nameof(GifAnimationDecoder.CreateTextureFromFrame))]
+    [HarmonyPostfix]
+    private static void GifFrameNonReadablePatch(Texture2D __result)
+    {
+        MakeNonReadable(__result);
+    }
+
     [HarmonyPatch(typeof(SprayInspector), nameof(SprayInspector.OnGUI))]
     internal static class InspectorPatch
     {
