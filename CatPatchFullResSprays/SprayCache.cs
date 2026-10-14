@@ -6,7 +6,7 @@ using System.Text;
 
 namespace CatPatchFullResSprays;
 
-internal sealed class SprayCache : IDisposable
+internal sealed class SprayCache
 {
     private const int MaxEntries = 8192;
     private readonly object _lock = new();
@@ -243,10 +243,10 @@ internal sealed class SprayCache : IDisposable
 
     private void RememberFile(string key, string id)
     {
+        Plugin.LogVerbose($"SprayCache: RememberFile: id={id}, key={key}");
         if (string.IsNullOrEmpty(key))
             return;
 
-        Plugin.LogVerbose($"SprayCache: RememberFile: id={id}, key={key}");
         if (_files.Count >= MaxEntries)
             _files.Remove(_files.Keys.First());
         _files[key] = id;
@@ -254,7 +254,7 @@ internal sealed class SprayCache : IDisposable
 
     private static bool IsImageExtension(string extension)
     {
-        return extension is ".png" or ".gif" or ".jpg" or ".webp" or ".bmp" or ".img";
+        return extension is ".png" or ".gif" or ".jpg" or ".jpeg" or ".img";
     }
 
     private static string ImageExtension(byte[] bytes)
@@ -266,8 +266,6 @@ internal sealed class SprayCache : IDisposable
             return ".gif";
         if (bytes.Length >= 3 && bytes[0] == 255 && bytes[1] == 216 && bytes[2] == 255)
             return ".jpg";
-        if (bytes.Length >= 2 && bytes[0] == 'B' && bytes[1] == 'M')
-            return ".bmp";
         return ".img";
     }
 
@@ -283,7 +281,8 @@ internal sealed class SprayCache : IDisposable
         {
             Directory.CreateDirectory(_directory);
             long replacedLength = _disk.TryGetValue(image.Id, out var replacing) ? replacing.Length : 0;
-            Plugin.LogVerbose($"SprayCache: WriteDisk: Prev size {replacedLength / 1024}KiB");
+            if (replacedLength != 0)
+                Plugin.LogVerbose($"SprayCache: WriteDisk: Prev size {replacedLength / 1024}KiB");
 
             foreach (KeyValuePair<string, DiskEntry> candidate in _disk.OrderBy(p => p.Value.Accessed).ToArray())
             {
@@ -413,10 +412,5 @@ internal sealed class SprayCache : IDisposable
                     RemoveDisk(id);
             }
         }
-    }
-
-    public void Dispose()
-    {
-        Close(false);
     }
 }

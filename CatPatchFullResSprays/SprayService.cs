@@ -25,12 +25,11 @@ internal sealed class SprayService
     private readonly Dictionary<string, int> _renderedSizes = [];
     private readonly List<Sprite> _retiredSprites = [];
     private int _scene;
-    private float _lastAlert = -10;
 
     public SprayService(NetworkController network)
     {
         _network = network;
-        string directory = Path.Combine(Paths.BepInExConfigPath, "Cat-Patch", "FullResSprays-cache");
+        string directory = Path.Combine(Paths.ConfigPath, "Cat-Patch", "FullResSpraysCache");
         long memory = Plugin.Instance.ConfigMemoryCacheMiB.Value * 1024L * 1024;
         long disk = Plugin.Instance.ConfigDiskCacheMiB.Value * 1024L * 1024;
         _cache = Task.Run(() => new SprayCache(directory, memory, disk));
@@ -65,8 +64,9 @@ internal sealed class SprayService
         {
             string fullPath = Path.GetFullPath(path);
             string key = await Task.Run(() => FileKey(fullPath), token);
-            Plugin.LogVerbose($"SprayService: Upload: key={key}");
             token.ThrowIfCancellationRequested();
+
+            Plugin.LogVerbose($"SprayService: Upload: key={key}");
             if (!_uploads.TryGetValue(key, out var task))
             {
                 if (_uploads.Count >= 16)
@@ -122,12 +122,16 @@ internal sealed class SprayService
     private async Task<SprayImage> UploadCore(string path, string key, CancellationToken token)
     {
         var cache = await _cache;
+
         var image = await Task.Run(() => cache.GetFile(key), token);
+        if (image != null)
+            Plugin.LogVerbose($"SprayService: UploadCore: Got image {key} from cache {image.Bytes.Length / 1024}KiB");
+
         string backendError = null;
         if (image == null || !image.BackendUploaded)
         {
-            Plugin.LogVerbose($"SprayService: UploadCore: Uploading to backend");
             var bytes = image?.Bytes ?? await Task.Run(() => ReadFile(path, key), token);
+            Plugin.LogVerbose($"SprayService: UploadCore: Got image bytes {bytes.Length}");
             await _httpSemaphore.WaitAsync(token);
             try
             {
@@ -150,14 +154,18 @@ internal sealed class SprayService
         }
         token.ThrowIfCancellationRequested();
 
+        // Store now as the host may send a cache update message when we successfully upload it
+        // We need the image in the cache by then, or else we'll redownload the image we just uploaded
+        Plugin.LogVerbose($"SprayService: UploadCore: Storing image");
+        image = await StoreAsync(image);
+        token.ThrowIfCancellationRequested();
+
         Plugin.LogVerbose($"SprayService: UploadCore: Uploading to host");
         bool hosted = await _network.UploadAsync(image);
         token.ThrowIfCancellationRequested();
         if (!hosted && !image.BackendUploaded)
             throw new InvalidOperationException("Spray upload failed: the host did not accept the image and the HTTP backend failed. " + backendError);
-        Plugin.LogVerbose($"SprayService: UploadCore: Storing image");
-        image = await StoreAsync(image);
-        token.ThrowIfCancellationRequested();
+
         return image;
     }
 
@@ -412,17 +420,16 @@ internal sealed class SprayService
         {
             if (sprite != null && used.Contains(sprite))
                 continue;
-            DestroySprite(sprite);
+            DestroySpriteAndTexture(sprite);
             _retiredSprites.Remove(sprite);
         }
     }
 
-    private static void DestroySprite(Sprite sprite)
+    private static void DestroySpriteAndTexture(Sprite sprite)
     {
         if (sprite == null)
             return;
-        if (sprite.texture != null)
-            Object.Destroy(sprite.texture);
+        Object.Destroy(sprite.texture);
         Object.Destroy(sprite);
     }
 
@@ -439,6 +446,13 @@ internal sealed class SprayService
         if (plugin == null)
             return;
 
+        foreach (var sprite in _retiredSprites)
+            DestroySpriteAndTexture(sprite);
+        _retiredSprites.Clear();
+
+        MainMenuSpraysData.Reset();
+
+        // Free CatPatch's cached data
         var controller = plugin.GetComponent<SprayController>();
         if (controller != null)
         {
@@ -446,14 +460,11 @@ internal sealed class SprayService
             controller._visualController.ClearActiveSprays();
 
             foreach (var sprite in controller._visualController._spriteCache.Values)
-                DestroySprite(sprite);
+                DestroySpriteAndTexture(sprite);
             controller._visualController._spriteCache.Clear();
 
             foreach (var texture in controller._previewTextureCache.Values)
-            {
-                if (texture != null)
                     Object.Destroy(texture);
-            }
             controller._previewTextureCache.Clear();
 
             lock (controller._uploadQueue._lock)
@@ -462,10 +473,6 @@ internal sealed class SprayService
             lock (controller._networkController._downloadCache._lock)
                 controller._networkController._downloadCache._cachedBytes.Clear();
         }
-
-        foreach (var sprite in _retiredSprites)
-            DestroySprite(sprite);
-        _retiredSprites.Clear();
 
         var inspector = plugin.GetComponent<SprayInspector>();
         if (inspector != null)
@@ -476,10 +483,8 @@ internal sealed class SprayService
                 gif?.DestroyTextures();
             inspector._gifAnimationCache.Clear();
             inspector._failedGifCacheKeys.Clear();
-            inspector._sprayCache = Array.Empty<SprayInstance>();
+            inspector._sprayCache.Clear();
         }
-
-        MainMenuSpraysData.Reset();
     }
 
     internal void ResetSession()
@@ -492,12 +497,9 @@ internal sealed class SprayService
         _inspected.Clear();
     }
 
-    internal void Alert(string message)
+    internal static void Alert(string message)
     {
         Plugin.Logger.LogWarning(message);
-        if (Time.realtimeSinceStartup - _lastAlert < 3)
-            return;
-        _lastAlert = Time.realtimeSinceStartup;
         if (PlayerCamera.main != null)
             PlayerCamera.main.DoAlert(message);
     }
@@ -506,6 +508,8 @@ internal sealed class SprayService
     {
         try
         {
+            // Dispose of the cache synchronously on the main thread to prevent potential races
+            // This will not deadlock as SprayCache never needs the main Unity thread
             _cache.GetAwaiter().GetResult().Close(clearDisk);
         }
         catch (Exception ex)

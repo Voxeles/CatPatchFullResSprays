@@ -44,13 +44,13 @@ public sealed class NetworkController : MonoBehaviour
 
     private enum Kind : byte
     {
-        Offer,
-        Next,
-        Fragment,
-        Result,
-        Get,
-        Notice,
-        Inspect
+        Offer, // I have this image, interested?
+        Next, // Tell me more
+        Fragment, // I'll tell you this much
+        Result, // Here's what happened with this transfer
+        Get, // Give me this image
+        Inspect, // What do you know about this image (size)?
+        Notice, // Here's what I know about this image
     }
 
     private sealed class Outgoing
@@ -59,7 +59,7 @@ public sealed class NetworkController : MonoBehaviour
         public string Token;
         public SprayImage Image;
         public int Index = -1;
-        public float Sent = -10;
+        public float SentTime = float.NegativeInfinity;
         public float Progress = Time.realtimeSinceStartup;
         public readonly float Started = Time.realtimeSinceStartup;
         public readonly TaskCompletionSource<bool> Completion = NewCompletion<bool>();
@@ -83,7 +83,7 @@ public sealed class NetworkController : MonoBehaviour
     {
         public string Id;
         public readonly float Started = Time.realtimeSinceStartup;
-        public float Sent = -10;
+        public float Sent = float.NegativeInfinity;
         public bool Receiving;
         public readonly TaskCompletionSource<SprayImage> Completion = NewCompletion<SprayImage>();
     }
@@ -209,7 +209,7 @@ public sealed class NetworkController : MonoBehaviour
             }
         }
 
-        foreach (KeyValuePair<string, Outgoing> pair in _outgoing.OrderBy(p => p.Value.Sent).ToArray())
+        foreach (KeyValuePair<string, Outgoing> pair in _outgoing.OrderBy(p => p.Value.SentTime).ToArray())
         {
             var item = pair.Value;
             if (now - item.Progress > 30 || now - item.Started > 180)
@@ -219,7 +219,8 @@ public sealed class NetworkController : MonoBehaviour
                 continue;
             }
 
-            if (now < _nextSend || now - item.Sent < 1)
+            if (now < _nextSend // Transfer interval
+                || now - item.SentTime < 5) // Retransmit fragment if no ACK (Next or Result) after a while
                 continue;
 
             try
@@ -232,7 +233,7 @@ public sealed class NetworkController : MonoBehaviour
                 Plugin.Logger.LogWarning("Spray send failed: " + ex.Message);
             }
 
-            item.Sent = now;
+            item.SentTime = now;
             _nextSend = now + TransferInterval;
         }
 
@@ -266,7 +267,7 @@ public sealed class NetworkController : MonoBehaviour
 
             if (!item.Receiving && now - item.Sent > 2)
             {
-                Plugin.LogVerbose($"NetworkController: Update: Download: Sending get id={item.Id}");
+                Plugin.LogVerbose($"NetworkController: Update: Download: Sending get for id={item.Id}");
                 item.Sent = now;
                 Send(0, Kind.Get, w =>
                 {
@@ -287,8 +288,10 @@ public sealed class NetworkController : MonoBehaviour
 
         var token = SessionToken;
         Task<bool> handshake = _handshake.Task;
+
         await Task.WhenAny(handshake, Task.Delay(5000, token));
         token.ThrowIfCancellationRequested();
+
         return handshake.IsCompleted && handshake.Result;
     }
 
@@ -499,6 +502,15 @@ public sealed class NetworkController : MonoBehaviour
                 return;
             }
 
+            if (kind == Kind.Inspect)
+            {
+                string id = ReadId(reader);
+                Plugin.LogVerbose($"NetworkController: Receive: Inspect for {id}");
+                if (IsHost)
+                    SendNotice(peer, id);
+                return;
+            }
+
             if (kind == Kind.Notice)
             {
                 string id = ReadId(reader);
@@ -509,21 +521,13 @@ public sealed class NetworkController : MonoBehaviour
                 return;
             }
 
-            if (kind == Kind.Inspect)
-            {
-                string id = ReadId(reader);
-                Plugin.LogVerbose($"NetworkController: Receive: Inspect for {id}");
-                if (IsHost)
-                    SendNotice(peer, id);
-                return;
-            }
-
             string token = reader.GetString(32);
             if (token.Length != 32 || !SprayImage.IsValidId(token))
                 throw new ArgumentException("Invalid transfer token.");
 
             string key = Key(peer, token);
             Plugin.LogVerbose($"NetworkController: Receive: TRANSFER KEY {key}");
+
             switch (kind)
             {
                 case Kind.Get:
@@ -550,7 +554,7 @@ public sealed class NetworkController : MonoBehaviour
                     {
                         Plugin.LogVerbose($"NetworkController: Receive: Next OK");
                         outgoing.Index = next;
-                        outgoing.Sent = -10;
+                        outgoing.SentTime = float.NegativeInfinity;
                         outgoing.Progress = Time.realtimeSinceStartup;
                     }
                     break;
@@ -708,7 +712,7 @@ public sealed class NetworkController : MonoBehaviour
 
             if (IsHost && cached != null && cached.Bytes.Length >= size)
             {
-                Plugin.LogVerbose($"NetworkController: Offer: Got from cache (duplicate)");
+                Plugin.LogVerbose($"NetworkController: Offer: Already available, sending cache update");
                 _incoming.Remove(key);
                 RememberReceipt(peer, token, true, "Already available.");
                 Announce(cached);
@@ -843,7 +847,7 @@ public sealed class NetworkController : MonoBehaviour
     {
         if (item.Index < 0)
         {
-            Plugin.LogVerbose($"NetworkController: SendPart: header token={item.Token} id={item.Image.Id} index={item.Index}");
+            Plugin.LogVerbose($"NetworkController: SendPart: Offering token={item.Token} id={item.Image.Id} index={item.Image.Bytes.Length / 1024}KiB");
             Send(item.Peer, Kind.Offer, w =>
             {
                 w.Put(item.Token);
@@ -855,7 +859,7 @@ public sealed class NetworkController : MonoBehaviour
         }
         else
         {
-            Plugin.LogVerbose($"NetworkController: SendPart: cont token={item.Token} id={item.Image.Id} index={item.Index}");
+            Plugin.LogVerbose($"NetworkController: SendPart: Sending part token={item.Token} id={item.Image.Id} index={item.Index}");
             int offset = item.Index * FragmentBuffer.FragmentSize;
             int length = Math.Min(FragmentBuffer.FragmentSize, item.Image.Bytes.Length - offset);
             Send(item.Peer, Kind.Fragment, w =>
@@ -988,7 +992,7 @@ public sealed class NetworkController : MonoBehaviour
 
     private void SendRaw(ushort peer, NetDataWriter writer)
     {
-        // Older KrokMP versions used to send the entire buffer through Steam, including padding. Trim it
+        // KrokMP 4.0.1 and before sent the entire NetDataWriter buffer through Steam, including padding. Trim it
         var exact = new NetDataWriter(false, writer.Length);
         exact.Put(writer.Data, 0, writer.Length);
 

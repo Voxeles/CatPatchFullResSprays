@@ -41,29 +41,29 @@ public class Plugin : BaseUnityPlugin
 			"Cache",
 			"memoryCacheMiB",
 			64,
-			new ConfigDescription("Maximum byte size for the RAM cache (Restart to apply)",
+			new ConfigDescription("Maximum byte size for the RAM cache",
 				new AcceptableValueRange<int>(11, 4096)));
 		ConfigDiskCacheMiB = Config.Bind(
 			"Cache",
 			"diskCacheMiB",
 			1024,
-			new ConfigDescription("Maximum byte size for the on-disk cache (Restart to apply)",
+			new ConfigDescription("Maximum byte size for the on-disk cache",
 				new AcceptableValueRange<int>(0, 10240)));
 		ConfigClearDiskCacheOnExit = Config.Bind(
 			"Cache",
 			"clearDiskCacheOnExit",
 			true,
-			"Delete cached downloads on game exit.\nThis is about the on-disk cache located in 'BepInEx/config/Cat-Patch/FullResSprays-cache' - Your spray library is never deleted");
+			"Delete cached downloads on game exit.\nThis is about the on-disk cache located in 'BepInEx/config/Cat-Patch/FullResSpraysCache' - Your spray library is never deleted");
 		ConfigRequireBackend = Config.Bind(
 			"Server",
 			"requireBackendUpload",
 			false,
-			"Only accept uploads reported by the client as successfully uploaded to CatPatch's HTTP backend (Restart session to apply)");
+			"Only accept uploads reported by the client as successfully uploaded to CatPatch's HTTP backend");
 		ConfigMaxSpraySizeMiB = Config.Bind(
 			"Server",
 			"maxSpraySizeMiB",
 			10,
-			new ConfigDescription("Maximum image file size accepted by the host (Restart session to apply)",
+			new ConfigDescription("Maximum image file size accepted by the host",
 				new AcceptableValueRange<int>(1, SprayImage.HardByteSizeLimit / 1024 / 1024)));
 		ConfigVerbose = Config.Bind(
 			"Debug",
