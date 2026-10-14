@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Reflection.Emit;
 using CatPatchspace;
 using HarmonyLib;
-using KrokoshaCasualtiesMP;
+using Together;
 using UnityEngine;
 
 namespace CatPatchFullResSprays;

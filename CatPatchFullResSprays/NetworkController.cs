@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using KrokoshaCasualtiesMP;
+using Together;
 using LiteNetLib;
 using LiteNetLib.Utils;
 using UnityEngine;
@@ -14,7 +14,10 @@ namespace CatPatchFullResSprays;
 public sealed class NetworkController : MonoBehaviour
 {
     internal const int ProtocolVersion = 2;
-    private const ushort Probe = 48910, ProbeAck = 48911, ToHost = 48912, ToClient = 48913;
+    private const string Probe = $"{Plugin.ModGuid}.probe";
+    private const string ProbeAck = $"{Plugin.ModGuid}.probe-ack";
+    private const string ToHost = $"{Plugin.ModGuid}.to-host";
+    private const string ToClient = $"{Plugin.ModGuid}.to-client";
     private const int MaxTransfers = 16;
     private const long TransferBudget = 64L * 1024 * 1024;
     private const float TransferInterval = 0.025f;
@@ -22,7 +25,7 @@ public sealed class NetworkController : MonoBehaviour
     public static NetworkController Instance { get; private set; }
     internal SprayService Service { get; private set; }
     internal CancellationToken SessionToken => _session.Token;
-    internal bool IsHost => !KrokoshaScavMultiplayer.network_system_is_running || Net.is_server;
+    internal bool IsHost => !Net.IsRunning || Net.IsServer;
     internal int HostMaxSize { get; private set; }
     internal bool HostRequiresBackend { get; private set; }
     private CancellationTokenSource _session = new();
@@ -36,7 +39,6 @@ public sealed class NetworkController : MonoBehaviour
     private readonly Dictionary<string, Download> _downloads = [];
     private readonly Dictionary<string, Receipt> _receipts = [];
     private readonly HashSet<string> _preparing = [];
-    private bool _registered;
     private bool _closed;
     private float _lastProbe = float.NegativeInfinity;
     private float _nextSend;
@@ -107,28 +109,33 @@ public sealed class NetworkController : MonoBehaviour
 
     private void Awake()
     {
+        if (Instance != null)
+        {
+            Destroy(this);
+            return;
+        }
         Instance = this;
+        RegisterReceivers();
         Service = new SprayService(this);
         SceneManager.sceneLoaded += SceneLoaded;
-        NetPlayer.OnPlayerJoined += PlayerJoined;
-        NetPlayer.OnPlayerLeft += PlayerLeft;
+        ScavPlayer.OnPlayerJoined += PlayerJoined;
+        ScavPlayer.OnPlayerLeft += PlayerLeft;
     }
 
-    private void PlayerJoined(NetPlayer player)
+    private void PlayerJoined(ScavPlayer player)
     {
-        EnsureReceiversRegistered();
         EnsureHostSettingsSet();
-        if (player != null && player.is_local)
+        if (player != null && player.IsLocal)
             _lastProbe = float.NegativeInfinity;
     }
 
-    private void PlayerLeft(NetPlayer player)
+    private void PlayerLeft(ScavPlayer player)
     {
         if (player == null)
             return;
-        if (player.is_local)
+        if (player.IsLocal)
             ResetSession();
-        else ForgetPeer(player.clientId.id);
+        else ForgetPeer(player.playerId.id);
     }
 
     private void ForgetPeer(ushort peer)
@@ -153,21 +160,17 @@ public sealed class NetworkController : MonoBehaviour
 
     private void SceneLoaded(Scene scene, LoadSceneMode mode)
     {
-        if (!KrokoshaScavMultiplayer.network_system_is_running)
+        if (!Net.IsRunning)
             ResetSession();
         Service.ClearScene();
     }
 
-    private void EnsureReceiversRegistered()
+    private static void RegisterReceivers()
     {
-        if (_registered || !KrokoshaScavMultiplayer.network_system_is_running)
-            return;
-
-        Net.RegisterServerReceiver(Probe, ReceiveProbe);
-        Net.RegisterClientReceiver(ProbeAck, ReceiveProbeAck);
-        Net.RegisterServerReceiver(ToHost, ReceiveHost);
-        Net.RegisterClientReceiver(ToClient, ReceiveClient);
-        _registered = true;
+        Multiplayer.RegisterCustomServerReceiver(Probe, ReceiveProbe);
+        Multiplayer.RegisterCustomClientReceiver(ProbeAck, ReceiveProbeAck);
+        Multiplayer.RegisterCustomServerReceiver(ToHost, ReceiveHost);
+        Multiplayer.RegisterCustomClientReceiver(ToClient, ReceiveClient);
     }
 
     private void EnsureHostSettingsSet()
@@ -184,11 +187,9 @@ public sealed class NetworkController : MonoBehaviour
         if (_closed)
             return;
 
-        EnsureReceiversRegistered();
-
         float now = Time.realtimeSinceStartup;
         if (!IsHost
-            && NetPlayer.LOCAL_PLAYER != null
+            && ScavPlayer.LocalPlayer != null
             && !_handshake.Task.IsCompleted
             && now - _lastProbe > 1)
         {
@@ -201,7 +202,7 @@ public sealed class NetworkController : MonoBehaviour
             else
             {
                 Plugin.LogVerbose($"NetworkController: Update: Sending probe");
-                var writer = Net.CreateWriter(Probe);
+                var writer = Multiplayer.CreateNamedWriter(Probe);
                 writer.Put(ProtocolVersion);
                 writer.Put(Plugin.ModVersion);
                 writer.Put(_helloToken);
@@ -395,8 +396,9 @@ public sealed class NetworkController : MonoBehaviour
         return _outgoing.Count < MaxTransfers && _outgoing.Values.Sum(t => (long)t.Image.Bytes.Length) + size <= TransferBudget;
     }
 
-    private static void ReceiveProbe(knetid peer, ref NetDataReader reader)
+    private static void ReceiveProbe(ScavPlayer player, NetDataReader reader)
     {
+        var peer = player.playerId;
         Plugin.LogVerbose($"ReceiveProbe: Received probe from {peer}");
         if (Instance == null)
             return;
@@ -424,7 +426,7 @@ public sealed class NetworkController : MonoBehaviour
 
             Instance._peers.Add(peer.id);
             Instance._peerSessions[peer.id] = session;
-            var writer = Net.CreateWriter(ProbeAck);
+            var writer = Multiplayer.CreateNamedWriter(ProbeAck);
             writer.Put(ProtocolVersion);
             writer.Put(Plugin.ModVersion);
             writer.Put(session);
@@ -439,7 +441,7 @@ public sealed class NetworkController : MonoBehaviour
         }
     }
 
-    private static void ReceiveProbeAck(knetid peer, ref NetDataReader reader)
+    private static void ReceiveProbeAck(NetDataReader reader)
     {
         Plugin.LogVerbose($"ReceiveProbeAck");
         if (Instance == null)
@@ -476,13 +478,13 @@ public sealed class NetworkController : MonoBehaviour
         }
     }
 
-    private static void ReceiveHost(knetid peer, ref NetDataReader reader)
+    private static void ReceiveHost(ScavPlayer player, NetDataReader reader)
     {
-        if (Instance != null && Instance._peers.Contains(peer.id))
-            Instance.Receive(peer.id, ref reader);
+        if (Instance != null && Instance._peers.Contains(player.playerId))
+            Instance.Receive(player.playerId, ref reader);
     }
 
-    private static void ReceiveClient(knetid peer, ref NetDataReader reader)
+    private static void ReceiveClient(NetDataReader reader)
     {
         if (Instance != null && Instance._handshake.Task.IsCompletedSuccessfully && Instance._handshake.Task.Result)
             Instance.Receive(0, ref reader);
@@ -954,7 +956,7 @@ public sealed class NetworkController : MonoBehaviour
             Plugin.Logger.LogWarning("Spray refresh failed: " + ex.Message);
         }
 
-        if (!KrokoshaScavMultiplayer.network_system_is_running)
+        if (!Net.IsRunning)
             return;
 
         foreach (ushort peer in _peers.ToArray())
@@ -979,7 +981,7 @@ public sealed class NetworkController : MonoBehaviour
 
     private void Send(ushort peer, Kind kind, Action<NetDataWriter> write)
     {
-        var writer = Net.CreateWriter(IsHost ? ToClient : ToHost);
+        var writer = Multiplayer.CreateNamedWriter(IsHost ? ToClient : ToHost);
         if (IsHost && !_peerSessions.ContainsKey(peer))
             return;
 
@@ -1023,7 +1025,6 @@ public sealed class NetworkController : MonoBehaviour
         _peers.Clear();
         _peerSessions.Clear();
         _helloToken = Guid.NewGuid().ToString("N");
-        _registered = false;
         _lastProbe = float.NegativeInfinity;
         _probeAttempts = 0;
         HostMaxSize = 0;
@@ -1040,8 +1041,8 @@ public sealed class NetworkController : MonoBehaviour
     {
         Close();
         SceneManager.sceneLoaded -= SceneLoaded;
-        NetPlayer.OnPlayerJoined -= PlayerJoined;
-        NetPlayer.OnPlayerLeft -= PlayerLeft;
+        ScavPlayer.OnPlayerJoined -= PlayerJoined;
+        ScavPlayer.OnPlayerLeft -= PlayerLeft;
         if (Instance == this)
             Instance = null;
     }

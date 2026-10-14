@@ -50,12 +50,12 @@
       <HintPath>$(BepInExDir)/plugins/CatPatch/CatPatch.dll</HintPath>
     </Reference>
 
-    <Reference Include="KrokoshaCasualtiesMP" Publicize="true">
-      <HintPath>$(BepInExDir)/plugins/KrokMP/KrokoshaCasualtiesMP.dll</HintPath>
+    <Reference Include="CasualtiesMP" Publicize="true">
+      <HintPath>$(BepInExDir)/plugins/Together/CasualtiesMP.dll</HintPath>
     </Reference>
 
     <Reference Include="LiteNetLib">
-      <HintPath>$(BepInExDir)/plugins/KrokMP/LiteNetLib.dll</HintPath>
+      <HintPath>$(BepInExDir)/plugins/Together/LiteNetLib.dll</HintPath>
     </Reference>
   </ItemGroup>
 

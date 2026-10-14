@@ -12,6 +12,8 @@ internal static class MainMenuSpraysData
 {
     private static Dictionary<SprayInstance, GameObject> _sprayToUiObjectDict = [];
     private static GameObject _templateUiObject = null;
+
+    public static bool IsInMainMenu => WorldGeneration.world == null;
     
     public static bool ShowSpraysOnMainMenu
     {
@@ -71,7 +73,7 @@ internal static class MainMenuSpraysData
             _sprayToUiObjectDict.Remove(spray);
             Object.Destroy(obj);
         }
-        if (KrokoshaCasualtiesUtils.Util.IsInMainMenu())
+        if (IsInMainMenu)
             UpdateSpray(spray, ShowSpraysOnMainMenu);
     }
     
@@ -89,7 +91,7 @@ internal static class MainMenuSpraysData
 
     public static void UpdateSpray(SprayInstance spr, bool show)
     {
-        if (!KrokoshaCasualtiesUtils.Util.IsInMainMenu() || spr == null || PreRunScript.instance == null || Camera.main == null)
+        if (!IsInMainMenu || spr == null || PreRunScript.instance == null || Camera.main == null)
             return;
         
         if (_sprayToUiObjectDict.TryGetValue(spr, out GameObject uiObj))
@@ -140,8 +142,7 @@ internal static class CatPatchCreateSprayPatch
     {
         if (!__result)
             return;
-        if (KrokoshaCasualtiesUtils.Util.IsInMainMenu())
-            MainMenuSpraysData.UpdateSpray(sprayObject.GetComponent<SprayInstance>(), MainMenuSpraysData.ShowSpraysOnMainMenu);
+        MainMenuSpraysData.UpdateSpray(sprayObject.GetComponent<SprayInstance>(), MainMenuSpraysData.ShowSpraysOnMainMenu);
     }
     
     [HarmonyPatch(nameof(SprayVisualController.ClearActiveSprays))]
