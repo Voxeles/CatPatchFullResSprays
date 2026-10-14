@@ -994,14 +994,10 @@ public sealed class NetworkController : MonoBehaviour
 
     private void SendRaw(ushort peer, NetDataWriter writer)
     {
-        // KrokMP 4.0.1 and before sent the entire NetDataWriter buffer through Steam, including padding. Trim it
-        var exact = new NetDataWriter(false, writer.Length);
-        exact.Put(writer.Data, 0, writer.Length);
-
         if (IsHost)
-            Net.Server_SendTo(DeliveryMethod.ReliableUnordered, exact, peer);
+            Net.Server_SendTo(DeliveryMethod.ReliableUnordered, writer, peer);
         else
-            Net.Client_Send(DeliveryMethod.ReliableUnordered, exact);
+            Net.Client_Send(DeliveryMethod.ReliableUnordered, writer);
     }
 
     public void ResetSession()
