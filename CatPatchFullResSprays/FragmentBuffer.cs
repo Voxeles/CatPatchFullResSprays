@@ -1,32 +1,53 @@
 using System;
+using LiteNetLib.Utils;
 
 namespace CatPatchFullResSprays;
 
 internal sealed class FragmentBuffer
 {
-    public const int FragmentSize = 200 * 1024; // Steamworks has a 500MB hard limit
+    public const int MinFragmentSize = 4 * 1024;
+    public const int MaxFragmentSize = 256 * 1024; // Steam's message limit is 512KiB, no point in going that high though
+
     public byte[] Bytes { get; }
-    public int NextIndex { get; private set; }
+    public int FragmentSize { get; }
+    public int Count { get; }
+    public int ToReceiveIndex { get; private set; } // Every fragment below this index has arrived
+    public int ReceivedCount { get; private set; }
 
-    public int Count => (Bytes.Length + FragmentSize - 1) / FragmentSize;
-    public bool IsComplete => NextIndex == Count;
+    public bool IsComplete => ReceivedCount == Count;
 
-    public FragmentBuffer(int size)
+    private readonly bool[] _receivedMap;
+
+    public FragmentBuffer(int size, int fragmentSize)
     {
-        if (size <= 0 || size > SprayImage.HardByteSizeLimit)
+        if (size is <= 0 or > SprayImage.HardByteSizeLimit)
             throw new ArgumentOutOfRangeException(nameof(size));
+        if (fragmentSize is < MinFragmentSize or > MaxFragmentSize)
+            throw new ArgumentOutOfRangeException(nameof(fragmentSize));
         Bytes = new byte[size];
+        FragmentSize = fragmentSize;
+        Count = CountFor(size, fragmentSize);
+        _receivedMap = new bool[Count];
     }
 
-    public void Add(int index, byte[] fragment)
+    public static int CountFor(int size, int fragmentSize) => (size + fragmentSize - 1) / fragmentSize;
+
+    public int Length(int index) => Math.Min(FragmentSize, Bytes.Length - index * FragmentSize);
+
+    public bool Add(int index, NetDataReader reader)
     {
-        if (index < 0 || index >= Count || fragment == null || fragment.Length != Math.Min(FragmentSize, Bytes.Length - index * FragmentSize))
+        if (index < 0 || index >= Count || reader.AvailableBytes != Length(index))
             throw new ArgumentException("Invalid fragment bounds.");
-        if (index > NextIndex)
-            throw new ArgumentException("Fragment arrived before its predecessor.");
-        if (index < NextIndex)
-            return;
-        Buffer.BlockCopy(fragment, 0, Bytes, index * FragmentSize, fragment.Length);
-        NextIndex++;
+        if (_receivedMap[index])
+            return false;
+
+        reader.GetBytes(Bytes, index * FragmentSize, Length(index));
+        _receivedMap[index] = true;
+
+        ReceivedCount++;
+        while (ToReceiveIndex < Count && _receivedMap[ToReceiveIndex])
+            ToReceiveIndex++;
+
+        return true;
     }
 }

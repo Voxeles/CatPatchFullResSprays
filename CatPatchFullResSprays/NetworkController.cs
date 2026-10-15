@@ -13,14 +13,20 @@ namespace CatPatchFullResSprays;
 
 public sealed class NetworkController : MonoBehaviour
 {
-    internal const int ProtocolVersion = 2;
+    private const int ProtocolVersion = 2;
     private const string Probe = $"{Plugin.ModGuid}.probe";
     private const string ProbeAck = $"{Plugin.ModGuid}.probe-ack";
     private const string ToHost = $"{Plugin.ModGuid}.to-host";
     private const string ToClient = $"{Plugin.ModGuid}.to-client";
     private const int MaxTransfers = 16;
     private const long TransferBudget = 64L * 1024 * 1024;
-    private const float TransferInterval = 0.025f;
+    private const int DefaultFragmentSize = 32 * 1024; // 32KiB seems like a nice balance
+    private const int WindowFragments = 8; // Max fragments per peer
+    private const long PeerWindowBytes = 256 * 1024; // MP mod sets a 1MiB per-peer buffer for steam transport, stay _way_ below that
+    private const long TotalWindowBytes = 1024 * 1024; // For sanity, don't exceed 1MiB total for all peers
+    private const int FrameFragmentLimit = 32;
+    private const float OfferIdleResend = 5;
+    private const float ResendTimeout = 5;
     private const float TransferIdleTimeout = 30;
     private const float TransferTimeout = 180;
     private const int MaxPreparing = 2;
@@ -29,8 +35,6 @@ public sealed class NetworkController : MonoBehaviour
     private const int MaxQueuedPerPeer = MaxTransfers;
     private const float QueueExpiry = 15;
     private const int MaxInspecting = 4;
-    private const float MinBackoff = 0.25f;
-    private const float MaxBackoff = 4;
     private const float DownloadIdleTimeout = 30;
     private const float DownloadTimeout = 600;
 
@@ -40,6 +44,7 @@ public sealed class NetworkController : MonoBehaviour
     internal bool IsHost => !Net.IsRunning || Net.IsServer;
     internal int HostMaxSize { get; private set; }
     internal bool HostRequiresBackend { get; private set; }
+
     private CancellationTokenSource _session = new();
     private TaskCompletionSource<bool> _handshake = NewCompletion<bool>();
     private int _probeAttempts;
@@ -55,14 +60,14 @@ public sealed class NetworkController : MonoBehaviour
     private readonly HashSet<string> _inspecting = [];
     private bool _closed;
     private float _lastProbe = float.NegativeInfinity;
-    private float _nextSend;
+    private int _pumpRoundRobinRotation;
     private int _generation;
 
     private enum Kind : byte
     {
         Offer, // I have this image, interested?
-        Next, // Tell me more
-        Fragment, // I'll tell you this much
+        Ack, // I am interested in this portion of it right now
+        Fragment, // Here's a bit of that portion
         Result, // Here's what happened with this transfer
         Get, // Give me this image
         Inspect, // What do you know about this image (size)?
@@ -75,13 +80,44 @@ public sealed class NetworkController : MonoBehaviour
         public ushort Peer;
         public string Token;
         public SprayImage Image;
-        public int Index = -1;
-        public float SentTime = float.NegativeInfinity;
+        public readonly int FragmentSize = DefaultFragmentSize;
+        public bool Accepted;
+        public int Acked; // Receiver has every fragment below this
+        public int Limit; // Receiver allows fragments below this
+        public int NextFragmentIndex;
+        public float LastAck;
+        public float OfferSent = float.NegativeInfinity;
         public float RetryAt = float.NegativeInfinity;
         public int Waits;
         public float Progress = Time.realtimeSinceStartup;
         public readonly float Started = Time.realtimeSinceStartup;
         public readonly TaskCompletionSource<bool> Completion = NewCompletion<bool>();
+
+        public int Count => FragmentBuffer.CountFor(Image.Bytes.Length, FragmentSize);
+        public int Offset(int index) => (int)Math.Min((long)index * FragmentSize, Image.Bytes.Length);
+        public int FragmentLength(int index) => Offset(index + 1) - Offset(index);
+        public long InFlightBytes => Offset(NextFragmentIndex) - Offset(Acked);
+
+        public void Ack(int receive, int limit, float now)
+        {
+            receive = Mathf.Clamp(receive, 0, Count);
+            limit = Mathf.Clamp(limit, 0, Count);
+            if (!Accepted)
+            {
+                Accepted = true;
+                LastAck = Progress = now;
+            }
+
+            // Acks may arrive out of order, so only ever move forward
+            if (receive > Acked)
+            {
+                Acked = receive;
+                LastAck = Progress = now;
+            }
+
+            Limit = Math.Max(Limit, limit);
+            NextFragmentIndex = Math.Max(NextFragmentIndex, Acked);
+        }
     }
 
     private sealed class Incoming
@@ -94,6 +130,8 @@ public sealed class NetworkController : MonoBehaviour
         public bool Saving;
         public bool Preparing = true;
         public FragmentBuffer Buffer;
+        public int Limit;
+        public bool NeedsAck;
         public float Progress = Time.realtimeSinceStartup;
         public readonly float Started = Time.realtimeSinceStartup;
     }
@@ -137,7 +175,7 @@ public sealed class NetworkController : MonoBehaviour
 
     private static float Backoff(int waits)
     {
-        float delay = Mathf.Min(MaxBackoff, MinBackoff * (1 << Mathf.Clamp(waits, 0, 5)));
+        float delay = Mathf.Min(4f, 0.25f * (1 << Mathf.Clamp(waits, 0, 5)));
         return delay * UnityEngine.Random.Range(0.75f, 1.25f);
     }
 
@@ -253,59 +291,62 @@ public sealed class NetworkController : MonoBehaviour
             PumpQueue();
         }
 
-        foreach (KeyValuePair<string, Outgoing> pair in _outgoing.OrderBy(p => p.Value.SentTime).ToArray())
+        foreach (var (key, item) in _outgoing.ToArray())
         {
-            var item = pair.Value;
             if (now - item.Progress > TransferIdleTimeout || now - item.Started > TransferTimeout)
             {
                 Plugin.LogVerbose($"NetworkController: Update: Outgoing: timed out id={item.Image.Id}");
-                FinishOutgoing(pair.Key, false);
+                FinishOutgoing(key, false);
                 continue;
             }
 
-            if (now < _nextSend // Transfer interval
-                || now < item.RetryAt // Receiver asked us to wait
-                || now - item.SentTime < 5) // Retransmit fragment if no ACK (Next or Result) after a while
-                continue;
-
-            try
+            if (!item.Accepted)
             {
-                Plugin.LogVerbose($"NetworkController: Update: Outgoing: Sending part id={item.Image.Id} idx={item.Index}");
-                SendPart(item);
+                if (now >= item.RetryAt && now - item.OfferSent >= OfferIdleResend)
+                {
+                    item.OfferSent = now;
+                    SendOffer(item);
+                }
             }
-            catch (Exception ex)
+            else if (item.Acked < item.NextFragmentIndex && now - item.LastAck > ResendTimeout)
             {
-                Plugin.Logger.LogWarning("Spray send failed: " + ex.Message);
+                Plugin.LogVerbose($"NetworkController: Update: Outgoing: No acks, resending from {item.Acked} id={item.Image.Id}");
+                item.NextFragmentIndex = item.Acked;
+                item.LastAck = now;
             }
-
-            item.SentTime = now;
-            _nextSend = now + TransferInterval;
         }
 
-        foreach (KeyValuePair<string, Incoming> pair in _incoming.ToArray())
+        PumpFragments();
+
+        foreach (var incoming in _incoming.Values)
         {
-            if ((now - pair.Value.Progress > TransferIdleTimeout || now - pair.Value.Started > TransferTimeout) && !pair.Value.Saving)
+            if (incoming.NeedsAck && !incoming.Preparing && !incoming.Saving)
+                SendAck(incoming);
+        }
+
+        foreach (var (key, item) in _incoming.ToArray())
+        {
+            if ((now - item.Progress > TransferIdleTimeout || now - item.Started > TransferTimeout) && !item.Saving)
             {
-                Plugin.LogVerbose($"NetworkController: Update: Incoming: timed out id={pair.Key}");
-                _incoming.Remove(pair.Key);
-                if (!IsHost && _downloads.TryGetValue(pair.Value.Token, out var download))
+                Plugin.LogVerbose($"NetworkController: Update: Incoming: timed out id={key}");
+                _incoming.Remove(key);
+                if (!IsHost && _downloads.TryGetValue(item.Token, out var download))
                 {
-                    _downloads.Remove(pair.Value.Token);
+                    _downloads.Remove(item.Token);
                     download.Completion.TrySetResult(null);
                 }
 
-                Result(pair.Value.Peer, pair.Value.Token, false, "Image transfer timed out.");
+                Result(item.Peer, item.Token, false, "Image transfer timed out.");
             }
         }
 
-        foreach (KeyValuePair<string, Download> pair in _downloads.ToArray())
+        foreach (var (key, item) in _downloads.ToArray())
         {
-            var item = pair.Value;
             if (!item.Receiving && now - item.LastActivity > DownloadIdleTimeout || now - item.Started > DownloadTimeout)
             {
-                Plugin.LogVerbose($"NetworkController: Update: Download: timed out id={pair.Key}");
-                _downloads.Remove(pair.Key);
-                _incoming.Remove(Key(0, pair.Key));
+                Plugin.LogVerbose($"NetworkController: Update: Download: timed out id={key}");
+                _downloads.Remove(key);
+                _incoming.Remove(Key(0, key));
                 item.Completion.TrySetResult(null);
                 continue;
             }
@@ -316,7 +357,7 @@ public sealed class NetworkController : MonoBehaviour
                 item.NextGet = now + 2;
                 Send(0, Kind.Get, w =>
                 {
-                    w.Put(pair.Key);
+                    w.Put(key);
                     w.Put(item.Id);
                 });
             }
@@ -596,29 +637,21 @@ public sealed class NetworkController : MonoBehaviour
                     int size = reader.GetInt();
                     string hash = reader.GetString(64);
                     bool backend = reader.GetBool();
-                    Plugin.LogVerbose($"NetworkController: Receive: Offer for {id} of size {size / 1024}Kib");
-                    Offer(peer, token, id, size, hash, backend);
+                    int fragmentSize = reader.GetInt();
+                    Plugin.LogVerbose($"NetworkController: Receive: Offer for {id} of size {size / 1024}KiB");
+                    Offer(peer, token, id, size, hash, backend, fragmentSize);
                     break;
-                case Kind.Next:
-                    int next = reader.GetInt();
-                    Plugin.LogVerbose($"NetworkController: Receive: Next request for index {next}");
-                    if (_outgoing.TryGetValue(key, out var outgoing)
-                        && next >= 0
-                        && next < (outgoing.Image.Bytes.Length + FragmentBuffer.FragmentSize - 1) / FragmentBuffer.FragmentSize
-                        && next == outgoing.Index + 1)
-                    {
-                        Plugin.LogVerbose($"NetworkController: Receive: Next OK");
-                        outgoing.Index = next;
-                        outgoing.SentTime = float.NegativeInfinity;
-                        outgoing.Progress = Time.realtimeSinceStartup;
-                    }
+                case Kind.Ack:
+                    int received = reader.GetInt();
+                    int limit = reader.GetInt();
+                    Plugin.LogVerbose($"NetworkController: Receive: Ack received={received} limit={limit}");
+                    if (_outgoing.TryGetValue(key, out var outgoing))
+                        outgoing.Ack(received, limit, Time.realtimeSinceStartup);
                     break;
                 case Kind.Fragment:
-                    int index = reader.GetInt(), length = reader.GetInt();
-                    Plugin.LogVerbose($"NetworkController: Receive: Fragment of index={index} size={length / 1024}KiB");
-                    if (length <= 0 || length > FragmentBuffer.FragmentSize || length != reader.AvailableBytes)
-                        throw new ArgumentException("Invalid fragment size.");
-                    
+                    int index = reader.GetInt();
+                    Plugin.LogVerbose($"NetworkController: Receive: Fragment of index={index} size={reader.AvailableBytes / 1024}KiB");
+
                     if (_receipts.TryGetValue(key, out var receipt))
                     {
                         Plugin.LogVerbose($"NetworkController: Receive: Fragment: Have receipt");
@@ -633,39 +666,37 @@ public sealed class NetworkController : MonoBehaviour
                         Plugin.LogVerbose($"NetworkController: Receive: Fragment: No prior request or bad timing (null={incoming == null})");
                         break;
                     }
-                    
-                    var bytes = new byte[length];
-                    reader.GetBytes(bytes, length);
 
-                    int before = incoming.Buffer.NextIndex;
-                    incoming.Buffer.Add(index, bytes);
+                    if (index >= incoming.Limit)
+                    {
+                        Plugin.LogVerbose($"NetworkController: Receive: Fragment: Outside granted credit ({incoming.Limit})");
+                        break;
+                    }
 
-                    if (incoming.Buffer.NextIndex != before)
+                    if (incoming.Buffer.Add(index, reader))
+                    {
                         incoming.Progress = Time.realtimeSinceStartup;
-                    
+                        incoming.Limit = Math.Min(incoming.Buffer.Count, incoming.Buffer.ToReceiveIndex + WindowFragments);
+                    }
+
+                    incoming.NeedsAck = true;
+
                     if (incoming.Buffer.IsComplete)
                     {
                         Plugin.LogVerbose($"NetworkController: Receive: Fragment: Completing");
+                        // Ack now to stop the sender from resending
+                        SendAck(incoming);
                         CompleteIncoming(incoming);
-                    }
-                    else
-                    {
-                        Plugin.LogVerbose($"NetworkController: Receive: Fragment: Sending request for next");
-                        Send(peer, Kind.Next, w =>
-                        {
-                            w.Put(token);
-                            w.Put(incoming.Buffer.NextIndex);
-                        });
                     }
 
                     break;
                 case Kind.Wait:
                     Plugin.LogVerbose($"NetworkController: Receive: Wait");
                     float waitNow = Time.realtimeSinceStartup;
-                    if (_outgoing.TryGetValue(key, out var waiting))
+                    if (_outgoing.TryGetValue(key, out var waiting) && !waiting.Accepted)
                     {
                         waiting.Progress = waitNow;
-                        waiting.SentTime = float.NegativeInfinity;
+                        waiting.OfferSent = float.NegativeInfinity;
                         waiting.RetryAt = waitNow + Backoff(waiting.Waits++);
                     }
 
@@ -705,7 +736,7 @@ public sealed class NetworkController : MonoBehaviour
         return id;
     }
 
-    private async void Offer(ushort peer, string token, string id, int size, string hash, bool backend)
+    private async void Offer(ushort peer, string token, string id, int size, string hash, bool backend, int fragmentSize)
     {
         Plugin.LogVerbose($"NetworkController: Offer: peer={peer}, id={id}, size={size / 1024}KiB");
         string key = Key(peer, token);
@@ -724,15 +755,7 @@ public sealed class NetworkController : MonoBehaviour
             {
                 Plugin.LogVerbose($"NetworkController: Offer: existing...");
                 if (!existing.Saving && !existing.Preparing)
-                {
-                    Plugin.LogVerbose($"NetworkController: Offer: Sending next request for index {existing.Buffer.NextIndex}");
-                    Send(peer, Kind.Next, w =>
-                    {
-                        w.Put(token);
-                        w.Put(existing.Buffer.NextIndex);
-                    });
-                }
-
+                    SendAck(existing); // The sender missed our Ack
                 return;
             }
 
@@ -745,6 +768,7 @@ public sealed class NetworkController : MonoBehaviour
 
             if (size <= 0
                 || size > SprayImage.HardByteSizeLimit
+                || fragmentSize is < FragmentBuffer.MinFragmentSize or > FragmentBuffer.MaxFragmentSize
                 || hash.Length != 64
                 || !SprayImage.IsValidId(hash)
                 || id.StartsWith("custom-", StringComparison.Ordinal) && (id != "custom-" + hash || backend))
@@ -776,7 +800,7 @@ public sealed class NetworkController : MonoBehaviour
                 Id = id, 
                 Hash = hash, 
                 Backend = backend, 
-                Buffer = new FragmentBuffer(size)
+                Buffer = new FragmentBuffer(size, fragmentSize)
             };
             _incoming[key] = incoming;
 
@@ -797,12 +821,9 @@ public sealed class NetworkController : MonoBehaviour
             if (!IsHost)
                 _downloads[token].Receiving = true;
             incoming.Preparing = false;
-            Send(peer, Kind.Next, w =>
-            {
-                w.Put(token);
-                w.Put(0);
-            });
-            Plugin.LogVerbose($"NetworkController: Offer: Sent request for more");
+            incoming.Limit = Math.Min(incoming.Buffer.Count, WindowFragments);
+            SendAck(incoming);
+            Plugin.LogVerbose($"NetworkController: Offer: Accepted with limit={incoming.Limit}");
         }
         catch (Exception ex)
         {
@@ -815,7 +836,7 @@ public sealed class NetworkController : MonoBehaviour
 
     private async void CompleteIncoming(Incoming incoming)
     {
-        Plugin.LogVerbose($"NetworkController: CompleteIncoming: {incoming.Id}, {incoming.Buffer.Count / 1024}KiB");
+        Plugin.LogVerbose($"NetworkController: CompleteIncoming: {incoming.Id}, {incoming.Buffer.Bytes.Length / 1024}KiB");
         incoming.Saving = true;
         string key = Key(incoming.Peer, incoming.Token);
         int generation = _generation;
@@ -913,7 +934,7 @@ public sealed class NetworkController : MonoBehaviour
     {
         for (int i = 0; i < _queue.Count;)
         {
-            if (_preparing.Count > MaxPreparing || _outgoing.Count + _preparing.Count > MaxTransfers)
+            if (_preparing.Count >= MaxPreparing || _outgoing.Count + _preparing.Count >= MaxTransfers)
                 break;
 
             var request = _queue[i];
@@ -975,11 +996,11 @@ public sealed class NetworkController : MonoBehaviour
         }
     }
 
-    private void SendPart(Outgoing item)
+    private void SendOffer(Outgoing item)
     {
-        if (item.Index < 0)
+        Plugin.LogVerbose($"NetworkController: SendOffer: token={item.Token} id={item.Image.Id} size={item.Image.Bytes.Length / 1024}KiB");
+        try
         {
-            Plugin.LogVerbose($"NetworkController: SendPart: Offering token={item.Token} id={item.Image.Id} index={item.Image.Bytes.Length / 1024}KiB");
             Send(item.Peer, Kind.Offer, w =>
             {
                 w.Put(item.Token);
@@ -987,20 +1008,88 @@ public sealed class NetworkController : MonoBehaviour
                 w.Put(item.Image.Bytes.Length);
                 w.Put(item.Image.Hash);
                 w.Put(item.Image.BackendUploaded);
+                w.Put(item.FragmentSize);
             });
         }
-        else
+        catch (Exception ex)
         {
-            Plugin.LogVerbose($"NetworkController: SendPart: Sending part token={item.Token} id={item.Image.Id} index={item.Index}");
-            int offset = item.Index * FragmentBuffer.FragmentSize;
-            int length = Math.Min(FragmentBuffer.FragmentSize, item.Image.Bytes.Length - offset);
+            Plugin.Logger.LogWarning("Spray offer failed: " + ex.Message);
+        }
+    }
+
+    private void SendAck(Incoming incoming)
+    {
+        incoming.NeedsAck = false;
+        Send(incoming.Peer, Kind.Ack, w =>
+        {
+            w.Put(incoming.Token);
+            w.Put(incoming.Buffer.ToReceiveIndex);
+            w.Put(incoming.Limit);
+        });
+    }
+
+    private void PumpFragments()
+    {
+        List<Outgoing> transfers = null;
+        var peerInFlight = new Dictionary<ushort, long>();
+        long totalInFlight = 0;
+        foreach (var item in _outgoing.Values)
+        {
+            totalInFlight += item.InFlightBytes;
+            peerInFlight[item.Peer] = peerInFlight.GetValueOrDefault(item.Peer) + item.InFlightBytes;
+            if (item.Accepted && item.NextFragmentIndex < item.Limit)
+                (transfers ??= []).Add(item);
+        }
+
+        if (transfers == null)
+            return;
+
+        int start = _pumpRoundRobinRotation++ % transfers.Count;
+        _pumpRoundRobinRotation &= int.MaxValue;
+        int sent = 0;
+        bool any = true;
+        while (any && sent < FrameFragmentLimit)
+        {
+            any = false;
+            for (int i = 0; i < transfers.Count && sent < FrameFragmentLimit; i++)
+            {
+                var item = transfers[(start + i) % transfers.Count];
+                if (item.NextFragmentIndex >= item.Limit)
+                    continue;
+
+                int length = item.FragmentLength(item.NextFragmentIndex);
+                long peerBytes = peerInFlight[item.Peer];
+                if (peerBytes > 0 && peerBytes + length > PeerWindowBytes
+                    || totalInFlight > 0 && totalInFlight + length > TotalWindowBytes)
+                    continue;
+
+                SendFragment(item, item.NextFragmentIndex);
+                item.NextFragmentIndex++;
+                peerInFlight[item.Peer] = peerBytes + length;
+                totalInFlight += length;
+                sent++;
+                any = true;
+            }
+        }
+    }
+
+    private void SendFragment(Outgoing item, int index)
+    {
+        Plugin.LogVerbose($"NetworkController: SendFragment: token={item.Token} id={item.Image.Id} index={index}");
+        try
+        {
+            int offset = item.Offset(index);
+            int length = item.FragmentLength(index);
             Send(item.Peer, Kind.Fragment, w =>
             {
                 w.Put(item.Token);
-                w.Put(item.Index);
-                w.Put(length);
+                w.Put(index);
                 w.Put(item.Image.Bytes, offset, length);
             });
+        }
+        catch (Exception ex)
+        {
+            Plugin.Logger.LogWarning("Spray send failed: " + ex.Message);
         }
     }
 
