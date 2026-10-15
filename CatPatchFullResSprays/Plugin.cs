@@ -87,7 +87,7 @@ public class Plugin : BaseUnityPlugin
 
 	internal static void LogVerbose(string message)
 	{
-		if (Instance.ConfigVerbose.Value)
+		if (Instance is not null && Instance.ConfigVerbose.Value)
 			Logger.LogInfo(message);
 	}
 }
