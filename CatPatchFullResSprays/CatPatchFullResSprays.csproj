@@ -3,7 +3,7 @@
     <TargetFramework>netstandard2.1</TargetFramework>
     <BepInExPluginGuid>meowharder.catpatch.fullressprays</BepInExPluginGuid>
     <ProjectName>CatPatchFullResSprays</ProjectName>
-    <Version>0.1.0</Version>
+    <Version>1.0.0</Version>
     <AssemblyName>$(ProjectName)</AssemblyName>
     <Product>$(ProjectName)</Product>
     <BepInExPluginName>$(ProjectName)</BepInExPluginName>
