@@ -33,12 +33,10 @@ internal static class Patches
     [HarmonyPrefix]
     private static bool DownloadFilePatch(string sprayId, Action<byte[]> onReady)
     {
-        if (NetworkController.Instance == null)
+        if (NetworkController.Instance == null || onReady == null)
             return true;
 
-        if (onReady != null)
-            NetworkController.Instance.Service.Download(sprayId, onReady);
-
+        NetworkController.Instance.Service.Download(sprayId, onReady);
         return false;
     }
 
