@@ -57,6 +57,10 @@
     <Reference Include="LiteNetLib">
       <HintPath>$(BepInExDir)/plugins/Together/LiteNetLib.dll</HintPath>
     </Reference>
+
+    <Reference Include="Steamworks.NET">
+      <HintPath>$(BepInExDir)/plugins/Together/Steamworks.NET.dll</HintPath>
+    </Reference>
   </ItemGroup>
 
   <PropertyGroup>

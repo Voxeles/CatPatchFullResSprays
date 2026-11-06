@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using Together;
 using LiteNetLib;
 using LiteNetLib.Utils;
+using Steamworks;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
@@ -20,8 +21,8 @@ public sealed class NetworkController : MonoBehaviour
     private const string ToClient = $"{Plugin.ModGuid}.to-client";
     private const int MaxTransfers = 16;
     private const long TransferBudget = 64L * 1024 * 1024; // Don't commit to over 64MiB in transfers, this limits the maximum size a single image can have as well
-    private const int DefaultFragmentSize = 32 * 1024; // 32KiB seems like a nice balance. These need to be small to be granular, but not too small to cause too much overhead
-    private const int WindowFragments = 8; // Max potential fragments in-flight per image
+    private const int DefaultFragmentSize = 16 * 1024; // 16KiB seems like a nice balance. These need to be small to be granular, but not too small to cause too much overhead
+    private const int WindowFragments = 16; // Max potential fragments in-flight per image
     private const long PeerWindowBytes = 256 * 1024; // MP mod sets a 1MiB per-peer buffer for steam transport, stay _way_ below that
     private const long TotalWindowBytes = 5L * 1024 * 1024; // For sanity, don't exceed 5MiB in-flight total for all peers
     private const int FrameFragmentLimit = 32;
@@ -1040,11 +1041,9 @@ public sealed class NetworkController : MonoBehaviour
     private void PumpFragments()
     {
         List<Outgoing> transfers = [];
-        var peerInFlight = new Dictionary<ushort, long>();
-        long totalInFlight = 0;
+        Dictionary<ushort, long> peerInFlight = [];
         foreach (var item in _outgoing.Values)
         {
-            totalInFlight += item.InFlightBytes;
             peerInFlight[item.Peer] = peerInFlight.GetValueOrDefault(item.Peer) + item.InFlightBytes;
             if (item.Accepted && item.NextFragmentIndex < item.Limit)
                 transfers.Add(item);
@@ -1052,6 +1051,18 @@ public sealed class NetworkController : MonoBehaviour
 
         if (transfers.Count == 0)
             return;
+
+        // Steam can be very picky and fails easily, so get the actual number of bytes in flight including gameplay packets
+        if (Net.Transport is TransportSteamworks steam)
+        {
+            foreach (ushort peer in peerInFlight.Keys.ToArray())
+            {
+                if (TryGetSteamPendingBytes(steam, peer, out long pending))
+                    peerInFlight[peer] = pending;
+            }
+        }
+
+        long totalInFlight = peerInFlight.Values.Sum();
 
         int start = _pumpRoundRobinRotation++ % transfers.Count;
         _pumpRoundRobinRotation &= int.MaxValue;
@@ -1080,6 +1091,42 @@ public sealed class NetworkController : MonoBehaviour
                 any = true;
             }
         }
+    }
+
+    private static bool TryGetSteamPendingBytes(TransportSteamworks steam, ushort peer, out long pending)
+    {
+        pending = 0;
+        HSteamNetConnection connection;
+        if (Net.IsServer)
+        {
+            if (!steam.SteamIDToClientIDDict.TryGet(peer, out ulong steamId)
+                || !steam.connectionMapping.TryGetValue(steamId, out var data))
+                return false;
+            connection = data.connection;
+        }
+        else
+        {
+            if (steam.serverUser == null)
+                return false;
+            connection = steam.serverUser.connection;
+        }
+
+        if (connection == HSteamNetConnection.Invalid)
+            return false;
+
+        var status = new SteamNetConnectionRealTimeStatus_t();
+        var lanes = new SteamNetConnectionRealTimeLaneStatus_t();
+        EResult result;
+        if (steam.is_steamserver)
+            result = SteamGameServerNetworkingSockets.GetConnectionRealTimeStatus(connection, ref status, 0, ref lanes);
+        else
+            result = SteamNetworkingSockets.GetConnectionRealTimeStatus(connection, ref status, 0, ref lanes);
+
+        if (result != EResult.k_EResultOK)
+            return false;
+
+        pending = (long)status.m_cbPendingReliable + status.m_cbPendingUnreliable;
+        return true;
     }
 
     private void SendFragment(Outgoing item, int index)
