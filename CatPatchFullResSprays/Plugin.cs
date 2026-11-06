@@ -41,14 +41,13 @@ public class Plugin : BaseUnityPlugin
 			"Cache",
 			"memoryCacheMiB",
 			64,
-			new ConfigDescription("Maximum size for the RAM cache",
+			new ConfigDescription("Maximum size for the RAM cache in MB",
 				new AcceptableValueRange<int>(11, 4096)));
 		ConfigDiskCacheMiB = Config.Bind(
 			"Cache",
 			"diskCacheMiB",
 			1024,
-			new ConfigDescription("Maximum size for the on-disk cache",
-				new AcceptableValueRange<int>(0, 10240)));
+			new ConfigDescription("Maximum size for the on-disk cache in MB. Set to -1 for unlimited"));
 		ConfigClearDiskCacheOnExit = Config.Bind(
 			"Cache",
 			"clearDiskCacheOnExit",
@@ -63,7 +62,7 @@ public class Plugin : BaseUnityPlugin
 			"Server",
 			"maxSpraySizeMiB",
 			10,
-			new ConfigDescription("Maximum image file size accepted by the host",
+			new ConfigDescription("Maximum image file size accepted by the host, in MB",
 				new AcceptableValueRange<int>(1, SprayImage.HardByteSizeLimit / 1024 / 1024)));
 		ConfigVerbose = Config.Bind(
 			"Debug",

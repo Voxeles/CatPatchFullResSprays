@@ -32,6 +32,8 @@ internal sealed class SprayService
         string directory = Path.Combine(Paths.ConfigPath, "Cat-Patch", "FullResSpraysCache");
         long memory = Plugin.Instance.ConfigMemoryCacheMiB.Value * 1024L * 1024;
         long disk = Plugin.Instance.ConfigDiskCacheMiB.Value * 1024L * 1024;
+        if (disk < 0)
+            disk = 1024L * 1024L * 1024L * 1024L * 1024L; // 1 Petabyte max should be enough for now
         _cache = Task.Run(() => new SprayCache(directory, memory, disk));
     }
 

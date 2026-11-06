@@ -8,7 +8,6 @@ namespace CatPatchFullResSprays;
 
 internal sealed class SprayCache
 {
-    private const int MaxEntries = 8192;
     private readonly object _lock = new();
     private readonly string _directory;
     private readonly Dictionary<string, LinkedListNode<SprayImage>> _memory = new();
@@ -232,7 +231,7 @@ internal sealed class SprayCache
 
         _memory[image.Id] = _lru.AddFirst(image);
         _memoryBytes += image.Bytes.Length;
-        while (_memoryBytes > _memoryLimit || _memory.Count > MaxEntries)
+        while (_memoryBytes > _memoryLimit)
         {
             LinkedListNode<SprayImage> last = _lru.Last;
             _memoryBytes -= last.Value.Bytes.Length;
@@ -247,8 +246,6 @@ internal sealed class SprayCache
         if (string.IsNullOrEmpty(key))
             return;
 
-        if (_files.Count >= MaxEntries)
-            _files.Remove(_files.Keys.First());
         _files[key] = id;
     }
 
@@ -284,18 +281,21 @@ internal sealed class SprayCache
             if (replacedLength != 0)
                 Plugin.LogVerbose($"SprayCache: WriteDisk: Prev size {replacedLength / 1024}KiB");
 
-            foreach (KeyValuePair<string, DiskEntry> candidate in _disk.OrderBy(p => p.Value.Accessed).ToArray())
+            if (_diskBytes - replacedLength + length > _diskLimit)
             {
-                if (_diskBytes - replacedLength + length <= _diskLimit && (_disk.Count < MaxEntries || replacing != null))
-                    break;
-                if (candidate.Key != image.Id)
+                foreach (KeyValuePair<string, DiskEntry> candidate in _disk.OrderBy(p => p.Value.Accessed).ToArray())
                 {
-                    Plugin.LogVerbose($"SprayCache: WriteDisk: Removing {candidate.Key} to make room");
-                    RemoveDisk(candidate.Key);
+                    if (candidate.Key != image.Id)
+                    {
+                        Plugin.LogVerbose($"SprayCache: WriteDisk: Removing {candidate.Key} to make room");
+                        RemoveDisk(candidate.Key);
+                    }
+                    if (_diskBytes - replacedLength + length <= _diskLimit)
+                        break;
                 }
             }
 
-            if (_diskBytes - replacedLength + length > _diskLimit || _disk.Count >= MaxEntries && replacing == null)
+            if (_diskBytes - replacedLength + length > _diskLimit)
             {
                 Plugin.Logger.LogWarning("Disk cache cannot make space; existing files may be locked.");
                 return;
@@ -356,11 +356,14 @@ internal sealed class SprayCache
 
     private void TrimDisk()
     {
+        if (_diskBytes <= _diskLimit)
+            return;
+
         foreach (KeyValuePair<string, DiskEntry> candidate in _disk.OrderBy(p => p.Value.Accessed).ToArray())
         {
-            if (_diskBytes <= _diskLimit && _disk.Count <= MaxEntries)
-                break;
             RemoveDisk(candidate.Key);
+            if (_diskBytes <= _diskLimit)
+                break;
         }
     }
 

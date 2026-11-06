@@ -19,18 +19,18 @@ public sealed class NetworkController : MonoBehaviour
     private const string ToHost = $"{Plugin.ModGuid}.to-host";
     private const string ToClient = $"{Plugin.ModGuid}.to-client";
     private const int MaxTransfers = 16;
-    private const long TransferBudget = 64L * 1024 * 1024;
-    private const int DefaultFragmentSize = 32 * 1024; // 32KiB seems like a nice balance
-    private const int WindowFragments = 8; // Max fragments per peer
+    private const long TransferBudget = 64L * 1024 * 1024; // Don't commit to over 64MiB in transfers, this limits the maximum size a single image can have as well
+    private const int DefaultFragmentSize = 32 * 1024; // 32KiB seems like a nice balance. These need to be small to be granular, but not too small to cause too much overhead
+    private const int WindowFragments = 8; // Max potential fragments in-flight per image
     private const long PeerWindowBytes = 256 * 1024; // MP mod sets a 1MiB per-peer buffer for steam transport, stay _way_ below that
-    private const long TotalWindowBytes = 1024 * 1024; // For sanity, don't exceed 1MiB total for all peers
+    private const long TotalWindowBytes = 5L * 1024 * 1024; // For sanity, don't exceed 5MiB in-flight total for all peers
     private const int FrameFragmentLimit = 32;
     private const float OfferIdleResend = 5;
     private const float ResendTimeout = 5;
     private const float TransferIdleTimeout = 30;
     private const float TransferTimeout = 180;
     private const int MaxPreparing = 2;
-    private const int MaxServesPerPeer = 2;
+    private const int MaxServesPerPeer = 4;
     private const int MaxQueued = 64;
     private const int MaxQueuedPerPeer = MaxTransfers;
     private const float QueueExpiry = 15;
@@ -67,7 +67,7 @@ public sealed class NetworkController : MonoBehaviour
     {
         Offer, // I have this image, interested?
         Ack, // I am interested in this portion of it right now
-        Fragment, // Here's a bit of that portion
+        Fragment, // Here's a fragment from that portion
         Result, // Here's what happened with this transfer
         Get, // Give me this image
         Inspect, // What do you know about this image (size)?
@@ -90,6 +90,7 @@ public sealed class NetworkController : MonoBehaviour
         public float RetryAt = float.NegativeInfinity;
         public int Waits;
         public float Progress = Time.realtimeSinceStartup;
+        public bool Stalled = false;
         public readonly float Started = Time.realtimeSinceStartup;
         public readonly TaskCompletionSource<bool> Completion = NewCompletion<bool>();
 
@@ -113,6 +114,7 @@ public sealed class NetworkController : MonoBehaviour
             {
                 Acked = receive;
                 LastAck = Progress = now;
+                Stalled = false;
             }
 
             Limit = Math.Max(Limit, limit);
@@ -310,9 +312,16 @@ public sealed class NetworkController : MonoBehaviour
             }
             else if (item.Acked < item.NextFragmentIndex && now - item.LastAck > ResendTimeout)
             {
+                if (item.Stalled)
+                    continue;
                 Plugin.LogVerbose($"NetworkController: Update: Outgoing: No acks, resending from {item.Acked} id={item.Image.Id}");
+                // Rewind the state by pretending we didn't send these fragments
                 item.NextFragmentIndex = item.Acked;
                 item.LastAck = now;
+                // The unacked fragments we sent could still be in the buffer, taking up space
+                // Only attempt to resend once, otherwise we might fill up the entire 1MiB buffer
+                // If we still get no Acks, then the whole transfer will time out due to being idle
+                item.Stalled = true;
             }
         }
 
@@ -388,12 +397,12 @@ public sealed class NetworkController : MonoBehaviour
         if (!await EnsureHostAsync())
             return false;
         token.ThrowIfCancellationRequested();
-        
+
         if (image == null
             || image.Bytes.Length > HostMaxSize
             || HostRequiresBackend && !image.BackendUploaded)
             return false;
-        
+
         if (IsHost)
         {
             Plugin.LogVerbose($"NetworkController: UploadAsync: Storing on host");
@@ -424,20 +433,20 @@ public sealed class NetworkController : MonoBehaviour
         if (!await EnsureHostAsync())
             return null;
         token.ThrowIfCancellationRequested();
-        
+
         if (IsHost)
         {
             Plugin.LogVerbose($"NetworkController: DownloadAsync: Reading from host...");
             return await Service.ReadAsync(id);
         }
-        
+
         var existing = _downloads.Values.FirstOrDefault(d => d.Id == id);
         if (existing != null)
         {
             Plugin.LogVerbose($"NetworkController: DownloadAsync: Awaiting existing download");
             return await existing.Completion.Task;
         }
-        
+
         if (_downloads.Count >= MaxTransfers)
         {
             Plugin.LogVerbose($"NetworkController: DownloadAsync: Too many downloads!");
@@ -785,7 +794,7 @@ public sealed class NetworkController : MonoBehaviour
 
             if (_preparing.Count >= MaxTransfers
                 || _incoming.Count >= MaxTransfers
-                || _incoming.Values.Count(t => t.Peer == peer) >= 2
+                || _incoming.Values.Count(t => t.Peer == peer) >= MaxServesPerPeer
                 || _incoming.Values.Sum(t => (long)t.Buffer.Bytes.Length) + size > TransferBudget)
             {
                 Plugin.LogVerbose($"NetworkController: Offer: Busy, asking to wait");
@@ -795,11 +804,11 @@ public sealed class NetworkController : MonoBehaviour
 
             var incoming = new Incoming
             {
-                Peer = peer, 
-                Token = token, 
-                Id = id, 
-                Hash = hash, 
-                Backend = backend, 
+                Peer = peer,
+                Token = token,
+                Id = id,
+                Hash = hash,
+                Backend = backend,
                 Buffer = new FragmentBuffer(size, fragmentSize)
             };
             _incoming[key] = incoming;
@@ -1030,7 +1039,7 @@ public sealed class NetworkController : MonoBehaviour
 
     private void PumpFragments()
     {
-        List<Outgoing> transfers = null;
+        List<Outgoing> transfers = [];
         var peerInFlight = new Dictionary<ushort, long>();
         long totalInFlight = 0;
         foreach (var item in _outgoing.Values)
@@ -1038,10 +1047,10 @@ public sealed class NetworkController : MonoBehaviour
             totalInFlight += item.InFlightBytes;
             peerInFlight[item.Peer] = peerInFlight.GetValueOrDefault(item.Peer) + item.InFlightBytes;
             if (item.Accepted && item.NextFragmentIndex < item.Limit)
-                (transfers ??= []).Add(item);
+                transfers.Add(item);
         }
 
-        if (transfers == null)
+        if (transfers.Count == 0)
             return;
 
         int start = _pumpRoundRobinRotation++ % transfers.Count;
